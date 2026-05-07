@@ -20,17 +20,17 @@
 
 use engine::game::effects::resolve_ability_chain;
 use engine::game::engine::apply_as_current;
+use engine::game::scenario::{GameScenario, P0};
 use engine::game::stack;
 use engine::game::triggers::process_triggers;
-use engine::game::zones::create_object;
 use engine::types::ability::{
     AbilityCondition, AbilityDefinition, AbilityKind, Effect, QuantityExpr, ResolvedAbility,
-    TargetFilter, TriggerDefinition,
+    SpellContext, TargetFilter, TriggerDefinition,
 };
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
-use engine::types::game_state::{GameState, WaitingFor};
-use engine::types::identifiers::{CardId, ObjectId};
+use engine::types::game_state::{PendingContinuation, WaitingFor};
+use engine::types::identifiers::ObjectId;
 use engine::types::player::PlayerId;
 use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
@@ -65,29 +65,23 @@ fn gran_gran_chain(source_id: ObjectId, controller: PlayerId) -> ResolvedAbility
 
 #[test]
 fn gran_gran_draw_then_discard_fires_both() {
-    let mut state = GameState::new_two_player(42);
-    let controller = PlayerId(0);
+    let controller = P0;
     let source_id = ObjectId(100);
 
-    // Seed hand with 2 cards so we can discard one.
-    let _hand_a = create_object(&mut state, CardId(1), controller, "A".into(), Zone::Hand);
-    let hand_b = create_object(&mut state, CardId(2), controller, "B".into(), Zone::Hand);
+    let mut scenario = GameScenario::new();
+    scenario.add_card_to_hand(controller, "A");
+    let hand_b = scenario.add_card_to_hand(controller, "B");
+    let library_card = scenario.add_card_to_library_top(controller, "Top");
+    let mut runner = scenario.build();
+    let state = runner.state_mut();
 
-    // Seed library so Draw has a card to draw.
-    let library_card = create_object(
-        &mut state,
-        CardId(3),
-        controller,
-        "Top".into(),
-        Zone::Library,
-    );
     let lib_size_before = state.players[0].library.len();
     let hand_size_before = state.players[0].hand.len();
 
     let chain = gran_gran_chain(source_id, controller);
     let mut events = Vec::new();
 
-    resolve_ability_chain(&mut state, &chain, &mut events, 0).unwrap();
+    resolve_ability_chain(state, &chain, &mut events, 0).unwrap();
 
     // Draw already happened (instant), library shrank by 1, hand grew by 1.
     assert_eq!(state.players[0].library.len(), lib_size_before - 1);
@@ -105,7 +99,7 @@ fn gran_gran_draw_then_discard_fires_both() {
 
     // Submit the player's discard selection (hand_b).
     apply_as_current(
-        &mut state,
+        state,
         GameAction::SelectCards {
             cards: vec![hand_b],
         },
@@ -123,31 +117,27 @@ fn gran_gran_draw_then_discard_fires_both() {
 fn gran_gran_empty_hand_still_draws() {
     // CR 101.4: "Draw, then discard" resolves sequentially — draw always fires.
     // If hand is empty after drawing, discard resolves as a no-op (or no choice).
-    let mut state = GameState::new_two_player(42);
-    let controller = PlayerId(0);
+    let controller = P0;
     let source_id = ObjectId(100);
 
-    // Hand starts empty; seed one card in library so Draw picks it up.
-    let library_card = create_object(
-        &mut state,
-        CardId(3),
-        controller,
-        "Top".into(),
-        Zone::Library,
-    );
+    let mut scenario = GameScenario::new();
+    let library_card = scenario.add_card_to_library_top(controller, "Top");
+    let mut runner = scenario.build();
+    let state = runner.state_mut();
+
     assert_eq!(state.players[0].hand.len(), 0);
 
     let chain = gran_gran_chain(source_id, controller);
     let mut events = Vec::new();
 
-    resolve_ability_chain(&mut state, &chain, &mut events, 0).unwrap();
+    resolve_ability_chain(state, &chain, &mut events, 0).unwrap();
 
     // Draw fired (card entered hand from library), then the forced-discard
     // branch auto-discarded the only card in hand: library_card is now in
     // graveyard with hand empty.
     if matches!(state.waiting_for, WaitingFor::DiscardChoice { .. }) {
         apply_as_current(
-            &mut state,
+            state,
             GameAction::SelectCards {
                 cards: vec![library_card],
             },
@@ -160,16 +150,8 @@ fn gran_gran_empty_hand_still_draws() {
 
 #[test]
 fn gran_gran_taps_trigger_draws_before_discard_choice() {
-    let mut state = GameState::new_two_player(42);
-    let controller = PlayerId(0);
+    let controller = P0;
 
-    let gran_gran = create_object(
-        &mut state,
-        CardId(100),
-        controller,
-        "Gran-Gran".into(),
-        Zone::Battlefield,
-    );
     let trigger = TriggerDefinition::new(TriggerMode::Taps)
         .execute(
             AbilityDefinition::new(
@@ -192,27 +174,23 @@ fn gran_gran_taps_trigger_draws_before_discard_choice() {
         )
         .valid_card(TargetFilter::SelfRef)
         .trigger_zones(vec![Zone::Battlefield]);
-    state
-        .objects
-        .get_mut(&gran_gran)
-        .unwrap()
-        .trigger_definitions
-        .push(trigger);
 
-    let old_hand_card = create_object(&mut state, CardId(1), controller, "A".into(), Zone::Hand);
-    let _other_hand_card = create_object(&mut state, CardId(2), controller, "B".into(), Zone::Hand);
-    let drawn_card = create_object(
-        &mut state,
-        CardId(3),
-        controller,
-        "Top".into(),
-        Zone::Library,
-    );
+    let mut scenario = GameScenario::new();
+    let gran_gran = scenario
+        .add_creature(controller, "Gran-Gran", 2, 2)
+        .with_trigger_definition(trigger)
+        .id();
+    let old_hand_card = scenario.add_card_to_hand(controller, "A");
+    scenario.add_card_to_hand(controller, "B");
+    let drawn_card = scenario.add_card_to_library_top(controller, "Top");
+    let mut runner = scenario.build();
+    let state = runner.state_mut();
+
     let lib_size_before = state.players[0].library.len();
     let hand_size_before = state.players[0].hand.len();
 
     process_triggers(
-        &mut state,
+        state,
         &[GameEvent::PermanentTapped {
             object_id: gran_gran,
             caused_by: None,
@@ -221,7 +199,7 @@ fn gran_gran_taps_trigger_draws_before_discard_choice() {
     assert_eq!(state.stack.len(), 1);
 
     let mut events = Vec::new();
-    stack::resolve_top(&mut state, &mut events);
+    stack::resolve_top(state, &mut events);
 
     assert_eq!(state.players[0].library.len(), lib_size_before - 1);
     assert_eq!(state.players[0].hand.len(), hand_size_before + 1);
@@ -235,7 +213,7 @@ fn gran_gran_taps_trigger_draws_before_discard_choice() {
     }
 
     apply_as_current(
-        &mut state,
+        state,
         GameAction::SelectCards {
             cards: vec![old_hand_card],
         },
@@ -299,30 +277,15 @@ fn abandon_attachments_chain(source_id: ObjectId, controller: PlayerId) -> Resol
 
 #[test]
 fn abandon_attachments_discard_then_draw_fires() {
-    use engine::types::ability::SpellContext;
-    use engine::types::game_state::PendingContinuation;
-
-    let mut state = GameState::new_two_player(42);
-    let controller = PlayerId(0);
+    let controller = P0;
     let source_id = ObjectId(100);
 
-    // Give controller one card in hand (the discard target).
-    let hand_card = create_object(&mut state, CardId(1), controller, "H".into(), Zone::Hand);
-    // Two cards in library so Draw(2) succeeds.
-    let lib_top = create_object(
-        &mut state,
-        CardId(2),
-        controller,
-        "L1".into(),
-        Zone::Library,
-    );
-    let lib_second = create_object(
-        &mut state,
-        CardId(3),
-        controller,
-        "L2".into(),
-        Zone::Library,
-    );
+    let mut scenario = GameScenario::new();
+    let hand_card = scenario.add_card_to_hand(controller, "H");
+    let lib_top = scenario.add_card_to_library_top(controller, "L1");
+    let lib_second = scenario.add_card_to_library_top(controller, "L2");
+    let mut runner = scenario.build();
+    let state = runner.state_mut();
 
     // Simulate OptionalEffectChoice::Yes: strip `optional`, set
     // optional_effect_performed on context, and resolve the chain.
@@ -338,7 +301,7 @@ fn abandon_attachments_discard_then_draw_fires() {
     }
 
     let mut events = Vec::new();
-    resolve_ability_chain(&mut state, &chain, &mut events, 0).unwrap();
+    resolve_ability_chain(state, &chain, &mut events, 0).unwrap();
 
     // Discard should have paused on DiscardChoice (or auto-discarded since hand==count).
     // With hand==count==1, the forced-discard branch auto-resolves without WaitingFor.
@@ -355,7 +318,7 @@ fn abandon_attachments_discard_then_draw_fires() {
         match &state.waiting_for {
             WaitingFor::DiscardChoice { .. } => {
                 apply_as_current(
-                    &mut state,
+                    state,
                     GameAction::SelectCards {
                         cards: vec![hand_card],
                     },
@@ -396,27 +359,14 @@ fn abandon_attachments_empty_hand_vetoes_draw() {
     // Edge: player has `optional: true`, accepts, but has no card to discard.
     // CR 608.2c: empty-hand discard is a no-op → cost_payment_failed_flag set →
     // IfYouDo draw must NOT fire.
-    use engine::types::ability::SpellContext;
-
-    let mut state = GameState::new_two_player(42);
-    let controller = PlayerId(0);
+    let controller = P0;
     let source_id = ObjectId(100);
 
-    // Hand empty; library has cards (they should NOT be drawn).
-    let lib_top = create_object(
-        &mut state,
-        CardId(2),
-        controller,
-        "L1".into(),
-        Zone::Library,
-    );
-    let _lib_second = create_object(
-        &mut state,
-        CardId(3),
-        controller,
-        "L2".into(),
-        Zone::Library,
-    );
+    let mut scenario = GameScenario::new();
+    let lib_top = scenario.add_card_to_library_top(controller, "L1");
+    scenario.add_card_to_library_top(controller, "L2");
+    let mut runner = scenario.build();
+    let state = runner.state_mut();
 
     let mut chain = abandon_attachments_chain(source_id, controller);
     chain.optional = false;
@@ -430,7 +380,7 @@ fn abandon_attachments_empty_hand_vetoes_draw() {
     }
 
     let mut events = Vec::new();
-    resolve_ability_chain(&mut state, &chain, &mut events, 0).unwrap();
+    resolve_ability_chain(state, &chain, &mut events, 0).unwrap();
 
     // No card drawn — IfYouDo gated off by cost_payment_failed_flag.
     assert!(
@@ -448,30 +398,16 @@ fn abandon_attachments_empty_hand_vetoes_draw() {
 // wrong state snapshot").
 #[test]
 fn abandon_attachments_interactive_discard_drains_continuation_draw() {
-    use engine::types::ability::SpellContext;
-
-    let mut state = GameState::new_two_player(42);
-    let controller = PlayerId(0);
+    let controller = P0;
     let source_id = ObjectId(100);
 
-    // Two cards in hand so DiscardChoice is interactive (hand > count).
-    let hand_a = create_object(&mut state, CardId(1), controller, "A".into(), Zone::Hand);
-    let _hand_b = create_object(&mut state, CardId(2), controller, "B".into(), Zone::Hand);
-    // Two cards in library so Draw(2) has fuel.
-    let lib_top = create_object(
-        &mut state,
-        CardId(3),
-        controller,
-        "L1".into(),
-        Zone::Library,
-    );
-    let lib_second = create_object(
-        &mut state,
-        CardId(4),
-        controller,
-        "L2".into(),
-        Zone::Library,
-    );
+    let mut scenario = GameScenario::new();
+    let hand_a = scenario.add_card_to_hand(controller, "A");
+    scenario.add_card_to_hand(controller, "B");
+    let lib_top = scenario.add_card_to_library_top(controller, "L1");
+    let lib_second = scenario.add_card_to_library_top(controller, "L2");
+    let mut runner = scenario.build();
+    let state = runner.state_mut();
 
     let mut chain = abandon_attachments_chain(source_id, controller);
     chain.optional = false;
@@ -485,7 +421,7 @@ fn abandon_attachments_interactive_discard_drains_continuation_draw() {
     }
 
     let mut events = Vec::new();
-    resolve_ability_chain(&mut state, &chain, &mut events, 0).unwrap();
+    resolve_ability_chain(state, &chain, &mut events, 0).unwrap();
 
     // Outer Discard MUST have paused on DiscardChoice (the stashed-continuation path).
     assert!(
@@ -498,7 +434,7 @@ fn abandon_attachments_interactive_discard_drains_continuation_draw() {
 
     // Submit the discard.
     apply_as_current(
-        &mut state,
+        state,
         GameAction::SelectCards {
             cards: vec![hand_a],
         },

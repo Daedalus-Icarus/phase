@@ -8,6 +8,7 @@ use engine::types::ability::{
 };
 use engine::types::game_state::{CastingVariant, StackEntryKind};
 use engine::types::identifiers::{CardId, ObjectId};
+use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard};
 
 /// Helper: advance past TargetSelection if present, return the resulting WaitingFor.
@@ -1411,51 +1412,31 @@ fn zaffai_second_cast_is_suppressed_same_turn() {
 /// the turn surfaces `WaitingFor::MiracleReveal` once priority is entered.
 #[test]
 fn miracle_first_draw_surfaces_reveal_prompt() {
-    use engine::game::zones::create_object;
-    use engine::types::keywords::Keyword;
-
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     // Give P0 {W} available to pay the miracle cost.
     scenario.add_basic_land(P0, ManaColor::White);
 
-    let mut runner = scenario.build();
-
     // Put a miracle spell in P0's library as the top card, with an effect that
     // has no targets (DrawCards N) so resolution doesn't need target selection.
-    let miracle_obj = create_object(
-        runner.state_mut(),
-        CardId(900),
-        P0,
-        "TestMiracleDraw".to_string(),
-        Zone::Library,
-    );
-    {
-        let obj = runner.state_mut().objects.get_mut(&miracle_obj).unwrap();
-        obj.card_types
-            .core_types
-            .push(engine::types::card_type::CoreType::Sorcery);
-        obj.base_card_types = obj.card_types.clone();
-        obj.mana_cost = ManaCost::Cost {
+    let miracle_obj = scenario
+        .add_spell_to_library_top(P0, "TestMiracleDraw", false)
+        .with_mana_cost(ManaCost::Cost {
             shards: vec![],
-            generic: 5, // printed cost 5 — miracle cost is much cheaper
-        };
-        obj.keywords.push(Keyword::Miracle(ManaCost::Cost {
+            generic: 5,
+        })
+        .with_keyword(Keyword::Miracle(ManaCost::Cost {
             shards: vec![ManaCostShard::White],
             generic: 0,
-        }));
-        obj.base_keywords = obj.keywords.clone();
-        // Spell effect: draw 1 card. No targets → pipeline runs straight to finalize.
-        let ability = AbilityDefinition::new(
-            AbilityKind::Spell,
-            Effect::Draw {
-                count: QuantityExpr::Fixed { value: 1 },
-                target: TargetFilter::Controller,
-            },
-        );
-        Arc::make_mut(&mut obj.abilities).push(ability.clone());
-        Arc::make_mut(&mut obj.base_abilities).push(ability);
-    }
+        }))
+        .with_ability(Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        })
+        .id();
+
+    let mut runner = scenario.build();
+
     // Tap a mana source so {W} is in pool.
     runner.state_mut().players[0]
         .mana_pool
@@ -1496,33 +1477,19 @@ fn miracle_first_draw_surfaces_reveal_prompt() {
 /// consumes the offer and returns control to normal priority.
 #[test]
 fn miracle_decline_returns_to_priority() {
-    use engine::game::zones::create_object;
-    use engine::types::keywords::Keyword;
-
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
 
-    let mut runner = scenario.build();
-
-    let miracle_obj = create_object(
-        runner.state_mut(),
-        CardId(901),
-        P0,
-        "TestMiracle".to_string(),
-        Zone::Hand,
-    );
-    {
-        let obj = runner.state_mut().objects.get_mut(&miracle_obj).unwrap();
-        obj.card_types
-            .core_types
-            .push(engine::types::card_type::CoreType::Sorcery);
-        obj.base_card_types = obj.card_types.clone();
-        obj.keywords.push(Keyword::Miracle(ManaCost::Cost {
+    let miracle_obj = scenario
+        .add_spell_to_hand(P0, "TestMiracle", false)
+        .with_keyword(Keyword::Miracle(ManaCost::Cost {
             shards: vec![ManaCostShard::White],
             generic: 0,
-        }));
-        obj.base_keywords = obj.keywords.clone();
-    }
+        }))
+        .id();
+
+    let mut runner = scenario.build();
+
     // Seed the pending offer directly and set the reveal waiting state.
     runner
         .state_mut()
@@ -1575,12 +1542,25 @@ fn miracle_decline_returns_to_priority() {
 /// (CR 608.2g). The printed cost is ignored.
 #[test]
 fn miracle_accept_casts_for_miracle_cost() {
-    use engine::game::zones::create_object;
-    use engine::types::keywords::Keyword;
-
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     scenario.add_basic_land(P0, ManaColor::White);
+
+    let miracle_obj = scenario
+        .add_spell_to_hand(P0, "TestMiracle", false)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![],
+            generic: 99,
+        })
+        .with_keyword(Keyword::Miracle(ManaCost::Cost {
+            shards: vec![ManaCostShard::White],
+            generic: 0,
+        }))
+        .with_ability(Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        })
+        .id();
 
     let mut runner = scenario.build();
     // Tap the land for {W}.
@@ -1593,40 +1573,6 @@ fn miracle_accept_casts_for_miracle_cost() {
             Vec::new(),
         ));
 
-    let miracle_obj = create_object(
-        runner.state_mut(),
-        CardId(902),
-        P0,
-        "TestMiracle".to_string(),
-        Zone::Hand,
-    );
-    {
-        let obj = runner.state_mut().objects.get_mut(&miracle_obj).unwrap();
-        obj.card_types
-            .core_types
-            .push(engine::types::card_type::CoreType::Sorcery);
-        obj.base_card_types = obj.card_types.clone();
-        // Printed cost: prohibitively expensive.
-        obj.mana_cost = ManaCost::Cost {
-            shards: vec![],
-            generic: 99,
-        };
-        obj.keywords.push(Keyword::Miracle(ManaCost::Cost {
-            shards: vec![ManaCostShard::White],
-            generic: 0,
-        }));
-        obj.base_keywords = obj.keywords.clone();
-        // A simple no-target ability: draw a card.
-        let ability = AbilityDefinition::new(
-            AbilityKind::Spell,
-            Effect::Draw {
-                count: QuantityExpr::Fixed { value: 1 },
-                target: TargetFilter::Controller,
-            },
-        );
-        Arc::make_mut(&mut obj.abilities).push(ability.clone());
-        Arc::make_mut(&mut obj.base_abilities).push(ability);
-    }
     let card_id = runner.state().objects[&miracle_obj].card_id;
 
     // Phase 1: Surface the reveal prompt directly.
@@ -1718,12 +1664,25 @@ fn miracle_accept_casts_for_miracle_cost() {
 /// timing restrictions.
 #[test]
 fn miracle_sorcery_casts_during_draw_step() {
-    use engine::game::zones::create_object;
-    use engine::types::keywords::Keyword;
-
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::Draw);
     scenario.add_basic_land(P0, ManaColor::White);
+
+    let miracle_obj = scenario
+        .add_spell_to_hand(P0, "DrawStepMiracle", false)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![],
+            generic: 99,
+        })
+        .with_keyword(Keyword::Miracle(ManaCost::Cost {
+            shards: vec![ManaCostShard::White],
+            generic: 0,
+        }))
+        .with_ability(Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        })
+        .id();
 
     let mut runner = scenario.build();
     runner.state_mut().players[0]
@@ -1735,38 +1694,6 @@ fn miracle_sorcery_casts_during_draw_step() {
             Vec::new(),
         ));
 
-    let miracle_obj = create_object(
-        runner.state_mut(),
-        CardId(903),
-        P0,
-        "DrawStepMiracle".to_string(),
-        Zone::Hand,
-    );
-    {
-        let obj = runner.state_mut().objects.get_mut(&miracle_obj).unwrap();
-        obj.card_types
-            .core_types
-            .push(engine::types::card_type::CoreType::Sorcery);
-        obj.base_card_types = obj.card_types.clone();
-        obj.mana_cost = ManaCost::Cost {
-            shards: vec![],
-            generic: 99,
-        };
-        obj.keywords.push(Keyword::Miracle(ManaCost::Cost {
-            shards: vec![ManaCostShard::White],
-            generic: 0,
-        }));
-        obj.base_keywords = obj.keywords.clone();
-        let ability = AbilityDefinition::new(
-            AbilityKind::Spell,
-            Effect::Draw {
-                count: QuantityExpr::Fixed { value: 1 },
-                target: TargetFilter::Controller,
-            },
-        );
-        Arc::make_mut(&mut obj.abilities).push(ability.clone());
-        Arc::make_mut(&mut obj.base_abilities).push(ability);
-    }
     let card_id = runner.state().objects[&miracle_obj].card_id;
 
     // Reveal prompt during draw step.

@@ -15,14 +15,14 @@ use crate::game::zones::create_object;
 use crate::parser::oracle::parse_oracle_text;
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, AdditionalCost, Effect, PtValue, QuantityExpr,
-    ReplacementDefinition, StaticDefinition, TargetFilter, TriggerDefinition,
+    ReplacementDefinition, ResolvedAbility, StaticDefinition, TargetFilter, TriggerDefinition,
 };
 use crate::types::actions::GameAction;
 use crate::types::card::CardFace;
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
-use crate::types::game_state::{ActionResult, GameState, WaitingFor};
+use crate::types::game_state::{ActionResult, ConvokeMode, GameState, PendingCast, WaitingFor};
 use crate::types::identifiers::{CardId, ObjectId};
 use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaColor, ManaUnit};
@@ -192,16 +192,21 @@ impl GameScenario {
     /// Intended for count/visibility/setup tests where full card semantics are not needed.
     pub fn with_cards_in_hand(&mut self, player: PlayerId, names: &[&str]) -> &mut Self {
         for &name in names {
-            let card_id = CardId(self.state.next_object_id);
-            create_object(
-                &mut self.state,
-                card_id,
-                player,
-                name.to_string(),
-                Zone::Hand,
-            );
+            self.add_card_to_hand(player, name);
         }
         self
+    }
+
+    /// Add one generic named card to a player's hand without rules text.
+    pub fn add_card_to_hand(&mut self, player: PlayerId, name: &str) -> ObjectId {
+        let card_id = CardId(self.state.next_object_id);
+        create_object(
+            &mut self.state,
+            card_id,
+            player,
+            name.to_string(),
+            Zone::Hand,
+        )
     }
 
     /// Add generic named cards to the top of a player's library.
@@ -210,16 +215,21 @@ impl GameScenario {
     /// library-top convention (`Vec::last()` / pop-from-end flows).
     pub fn with_library_top(&mut self, player: PlayerId, names_top_first: &[&str]) -> &mut Self {
         for &name in names_top_first.iter().rev() {
-            let card_id = CardId(self.state.next_object_id);
-            create_object(
-                &mut self.state,
-                card_id,
-                player,
-                name.to_string(),
-                Zone::Library,
-            );
+            self.add_card_to_library_top(player, name);
         }
         self
+    }
+
+    /// Add one generic named card to the top of a player's library.
+    pub fn add_card_to_library_top(&mut self, player: PlayerId, name: &str) -> ObjectId {
+        let card_id = CardId(self.state.next_object_id);
+        create_object(
+            &mut self.state,
+            card_id,
+            player,
+            name.to_string(),
+            Zone::Library,
+        )
     }
 
     /// Add generic named cards to a player's graveyard without rules text.
@@ -519,6 +529,54 @@ impl GameScenario {
         };
         builder.from_oracle_text(oracle_text);
         builder
+    }
+
+    /// Add an instant or sorcery to a player's hand without Oracle text.
+    ///
+    /// Use `is_instant: true` for instants, `false` for sorceries.
+    pub fn add_spell_to_hand(
+        &mut self,
+        player: PlayerId,
+        name: &str,
+        is_instant: bool,
+    ) -> CardBuilder<'_> {
+        self.add_spell_to_zone(player, name, is_instant, Zone::Hand)
+    }
+
+    /// Add an instant or sorcery to the top of a player's library without Oracle text.
+    ///
+    /// Use `is_instant: true` for instants, `false` for sorceries.
+    pub fn add_spell_to_library_top(
+        &mut self,
+        player: PlayerId,
+        name: &str,
+        is_instant: bool,
+    ) -> CardBuilder<'_> {
+        self.add_spell_to_zone(player, name, is_instant, Zone::Library)
+    }
+
+    fn add_spell_to_zone(
+        &mut self,
+        player: PlayerId,
+        name: &str,
+        is_instant: bool,
+        zone: Zone,
+    ) -> CardBuilder<'_> {
+        let card_id = CardId(self.state.next_object_id);
+        let id = create_object(&mut self.state, card_id, player, name.to_string(), zone);
+        let obj = self.state.objects.get_mut(&id).unwrap();
+        let core_type = if is_instant {
+            CoreType::Instant
+        } else {
+            CoreType::Sorcery
+        };
+        obj.card_types.core_types.push(core_type);
+        obj.base_card_types = obj.card_types.clone();
+
+        CardBuilder {
+            state: &mut self.state,
+            id,
+        }
     }
 
     /// Consume the builder, returning a `GameRunner` for step-by-step execution.
@@ -898,6 +956,39 @@ impl GameRunner {
     /// expose (e.g., `waiting_for`, `combat`, `active_player`).
     pub fn state_mut(&mut self) -> &mut GameState {
         &mut self.state
+    }
+
+    /// Enter a synthetic mana-payment prompt for subsystem tests.
+    ///
+    /// Production casting creates `pending_cast` before `WaitingFor::ManaPayment`.
+    /// Tests that start at the payment subsystem use this helper to preserve that
+    /// invariant without open-coding a fake cast at each call site.
+    pub fn enter_mana_payment(
+        &mut self,
+        player: PlayerId,
+        convoke_mode: Option<ConvokeMode>,
+    ) -> &mut Self {
+        if self.state.pending_cast.is_none() {
+            self.state.pending_cast = Some(Box::new(PendingCast::new(
+                ObjectId(0),
+                CardId(0),
+                ResolvedAbility::new(
+                    Effect::Unimplemented {
+                        name: "SyntheticPaymentTestSpell".to_string(),
+                        description: None,
+                    },
+                    vec![],
+                    ObjectId(0),
+                    player,
+                ),
+                crate::types::mana::ManaCost::NoCost,
+            )));
+        }
+        self.state.waiting_for = WaitingFor::ManaPayment {
+            player,
+            convoke_mode,
+        };
+        self
     }
 
     /// Pass priority until a priority window is reached, or stop if progress stalls.
