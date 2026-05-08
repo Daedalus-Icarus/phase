@@ -1377,9 +1377,9 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
                 || record.core_types.contains(&CoreType::Artifact)
                 || record.subtypes.iter().any(|s| s == "Saga")
         }
-        FilterProp::Multicolored => record.colors.len() > 1,
-        // CR 105.2c: Colorless objects have no color.
-        FilterProp::Colorless => record.colors.is_empty(),
+        FilterProp::ColorCount { comparator, count } => {
+            comparator.evaluate(record.colors.len() as i32, i32::from(*count))
+        }
         FilterProp::Cmc { comparator, value } => match value {
             QuantityExpr::Fixed { value: v } => comparator.evaluate(record.mana_value as i32, *v),
             _ => {
@@ -1937,9 +1937,9 @@ fn matches_filter_prop(
                 .unwrap_or(0);
             obj.power.unwrap_or(0) > source_power
         }
-        FilterProp::Multicolored => obj.color.len() > 1,
-        // CR 105.2c: Colorless objects have no color.
-        FilterProp::Colorless => obj.color.is_empty(),
+        FilterProp::ColorCount { comparator, count } => {
+            comparator.evaluate(obj.color.len() as i32, i32::from(*count))
+        }
         FilterProp::HasSupertype { value } => obj.card_types.supertypes.contains(value),
         // CR 205.4b: Object does NOT have this color.
         FilterProp::NotColor { color } => !obj.color.contains(color),
@@ -2173,8 +2173,9 @@ fn zone_change_record_matches_property(
         // CR 105.1 / CR 202.2: Color membership on the event-time object.
         FilterProp::HasColor { color } => record.colors.contains(color),
         FilterProp::NotColor { color } => !record.colors.contains(color),
-        FilterProp::Multicolored => record.colors.len() > 1,
-        FilterProp::Colorless => record.colors.is_empty(),
+        FilterProp::ColorCount { comparator, count } => {
+            comparator.evaluate(record.colors.len() as i32, i32::from(*count))
+        }
         // CR 208.1 / CR 107.2: `toughness > power` comparison on the snapshot.
         FilterProp::ToughnessGTPower => record.toughness.unwrap_or(0) > record.power.unwrap_or(0),
         // CR 111.1: Token identity as of the zone change. Token-ness is a

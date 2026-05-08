@@ -2257,7 +2257,23 @@ fn parse_property_descriptor(
 
     // CR 105.2c: "colorless creatures" — zero colors
     if desc_lower == "colorless" {
-        props.push(FilterProp::Colorless);
+        props.push(FilterProp::ColorCount {
+            comparator: Comparator::EQ,
+            count: 0,
+        });
+        return Some(TargetFilter::Typed(
+            TypedFilter::creature()
+                .controller(ControllerRef::You)
+                .properties(props),
+        ));
+    }
+
+    // CR 105.2a: "monocolored creatures" — exactly one color
+    if desc_lower == "monocolored" {
+        props.push(FilterProp::ColorCount {
+            comparator: Comparator::EQ,
+            count: 1,
+        });
         return Some(TargetFilter::Typed(
             TypedFilter::creature()
                 .controller(ControllerRef::You)
@@ -2267,7 +2283,10 @@ fn parse_property_descriptor(
 
     // CR 105.2: "multicolored creatures" — two or more colors
     if desc_lower == "multicolored" {
-        props.push(FilterProp::Multicolored);
+        props.push(FilterProp::ColorCount {
+            comparator: Comparator::GE,
+            count: 2,
+        });
         return Some(TargetFilter::Typed(
             TypedFilter::creature()
                 .controller(ControllerRef::You)
@@ -13936,11 +13955,31 @@ mod tests {
 
     #[test]
     fn static_other_colorless_creatures_get_plus() {
-        // CR 105.2b: "Other colorless creatures you control get +1/+1."
+        // CR 105.2c: "Other colorless creatures you control get +1/+1."
         let def = parse_static_line("Other colorless creatures you control get +1/+1.").unwrap();
         assert_eq!(def.mode, StaticMode::Continuous);
         if let Some(TargetFilter::Typed(ref tf)) = def.affected {
-            assert!(tf.properties.contains(&FilterProp::Colorless));
+            assert!(tf.properties.contains(&FilterProp::ColorCount {
+                comparator: Comparator::EQ,
+                count: 0,
+            }));
+            assert!(tf.properties.contains(&FilterProp::Another));
+            assert_eq!(tf.controller, Some(ControllerRef::You));
+        } else {
+            panic!("Expected Typed filter, got {:?}", def.affected);
+        }
+    }
+
+    #[test]
+    fn static_other_monocolored_creatures_get_plus() {
+        // CR 105.2a: "Other monocolored creatures you control get +1/+1."
+        let def = parse_static_line("Other monocolored creatures you control get +1/+1.").unwrap();
+        assert_eq!(def.mode, StaticMode::Continuous);
+        if let Some(TargetFilter::Typed(ref tf)) = def.affected {
+            assert!(tf.properties.contains(&FilterProp::ColorCount {
+                comparator: Comparator::EQ,
+                count: 1,
+            }));
             assert!(tf.properties.contains(&FilterProp::Another));
             assert_eq!(tf.controller, Some(ControllerRef::You));
         } else {
@@ -14007,7 +14046,10 @@ mod tests {
         let def = parse_static_line("Other multicolored creatures you control get +1/+0.").unwrap();
         assert_eq!(def.mode, StaticMode::Continuous);
         if let Some(TargetFilter::Typed(ref tf)) = def.affected {
-            assert!(tf.properties.contains(&FilterProp::Multicolored));
+            assert!(tf.properties.contains(&FilterProp::ColorCount {
+                comparator: Comparator::GE,
+                count: 2,
+            }));
             assert!(tf.properties.contains(&FilterProp::Another));
             assert_eq!(tf.controller, Some(ControllerRef::You));
         } else {

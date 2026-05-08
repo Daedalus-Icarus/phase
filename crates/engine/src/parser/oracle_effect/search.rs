@@ -2013,10 +2013,13 @@ mod tests {
             panic!("expected Typed filter, got {filter:?}");
         };
         assert!(typed.type_filters.contains(&TypeFilter::Creature));
-        assert!(typed
-            .properties
-            .iter()
-            .any(|property| matches!(property, FilterProp::Colorless)));
+        assert!(typed.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::ColorCount {
+                comparator: Comparator::EQ,
+                count: 0,
+            }
+        )));
         assert!(typed.properties.iter().any(|property| matches!(
             property,
             FilterProp::Cmc {
@@ -2150,10 +2153,13 @@ mod tests {
             panic!("expected Typed filter, got {filter:?}");
         };
         assert!(typed.type_filters.contains(&TypeFilter::Card));
-        assert!(typed
-            .properties
-            .iter()
-            .any(|property| matches!(property, FilterProp::Multicolored)));
+        assert!(typed.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::ColorCount {
+                comparator: Comparator::GE,
+                count: 2,
+            }
+        )));
     }
 
     #[test]

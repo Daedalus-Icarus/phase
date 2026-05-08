@@ -4883,9 +4883,12 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
         }
         // Handle "multicolored" as a spell property (not a type phrase)
         if scan_contains(spell_clause, "multicolored") {
-            def.valid_card = Some(TargetFilter::Typed(
-                TypedFilter::default().properties(vec![FilterProp::Multicolored]),
-            ));
+            def.valid_card = Some(TargetFilter::Typed(TypedFilter::default().properties(
+                vec![FilterProp::ColorCount {
+                    comparator: Comparator::GE,
+                    count: 2,
+                }],
+            )));
         } else {
             let (filter, _rest) = parse_type_phrase(spell_clause);
             let is_meaningful = match &filter {
@@ -8119,9 +8122,12 @@ mod tests {
         );
         assert_eq!(
             def.valid_card,
-            Some(TargetFilter::Typed(
-                TypedFilter::default().properties(vec![FilterProp::Multicolored])
-            ))
+            Some(TargetFilter::Typed(TypedFilter::default().properties(
+                vec![FilterProp::ColorCount {
+                    comparator: Comparator::GE,
+                    count: 2,
+                }]
+            )))
         );
     }
 
@@ -8135,7 +8141,10 @@ mod tests {
         assert_eq!(
             def.valid_card,
             Some(TargetFilter::Typed(
-                TypedFilter::new(TypeFilter::Card).properties(vec![FilterProp::Multicolored])
+                TypedFilter::new(TypeFilter::Card).properties(vec![FilterProp::ColorCount {
+                    comparator: Comparator::GE,
+                    count: 2,
+                }])
             ))
         );
         let execute = def.execute.as_deref().expect("trigger should execute");

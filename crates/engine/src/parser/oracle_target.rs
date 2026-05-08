@@ -1758,8 +1758,7 @@ fn is_adjective_prefix_prop(prop: &FilterProp) -> bool {
             | FilterProp::Unblocked
             // CR 105.1 + CR 205.2: color / supertype adjectives.
             | FilterProp::HasColor { .. }
-            | FilterProp::Colorless
-            | FilterProp::Multicolored
+            | FilterProp::ColorCount { .. }
             | FilterProp::NotColor { .. }
             | FilterProp::HasSupertype { .. }
             | FilterProp::NotSupertype { .. }
@@ -1956,15 +1955,32 @@ fn parse_color_prefix(text: &str) -> Option<(FilterProp, usize)> {
     Some((FilterProp::HasColor { color }, consumed))
 }
 
-/// Parse color-quality adjective prefixes: "colorless creature", "multicolored card", etc.
+/// Parse color-quality adjective prefixes: "colorless creature",
+/// "monocolored permanent", "multicolored card", etc.
 /// Returns the filter property and bytes consumed including trailing space.
 fn parse_color_quality_prefix(text: &str) -> Option<(FilterProp, usize)> {
     let (rest, prop) = alt((
         value(
-            FilterProp::Colorless,
+            FilterProp::ColorCount {
+                comparator: Comparator::EQ,
+                count: 0,
+            },
             tag::<_, _, OracleError<'_>>("colorless "),
         ),
-        value(FilterProp::Multicolored, tag("multicolored ")),
+        value(
+            FilterProp::ColorCount {
+                comparator: Comparator::EQ,
+                count: 1,
+            },
+            tag("monocolored "),
+        ),
+        value(
+            FilterProp::ColorCount {
+                comparator: Comparator::GE,
+                count: 2,
+            },
+            tag("multicolored "),
+        ),
     ))
     .parse(text)
     .ok()?;
@@ -4052,7 +4068,10 @@ mod tests {
         assert_eq!(
             f,
             TargetFilter::Typed(TypedFilter::creature().properties(vec![
-                FilterProp::Colorless,
+                FilterProp::ColorCount {
+                    comparator: Comparator::EQ,
+                    count: 0,
+                },
                 FilterProp::Cmc {
                     comparator: Comparator::GE,
                     value: QuantityExpr::Fixed { value: 7 },
@@ -4073,18 +4092,39 @@ mod tests {
             panic!("expected artifact branch");
         };
         assert!(artifact.type_filters.contains(&TypeFilter::Artifact));
-        assert!(!artifact
-            .properties
-            .iter()
-            .any(|property| matches!(property, FilterProp::Colorless)));
+        assert!(!artifact.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::ColorCount {
+                comparator: Comparator::EQ,
+                count: 0,
+            }
+        )));
         let TargetFilter::Typed(creature) = &filters[1] else {
             panic!("expected creature branch");
         };
         assert!(creature.type_filters.contains(&TypeFilter::Creature));
-        assert!(creature
-            .properties
-            .iter()
-            .any(|property| matches!(property, FilterProp::Colorless)));
+        assert!(creature.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::ColorCount {
+                comparator: Comparator::EQ,
+                count: 0,
+            }
+        )));
+    }
+
+    #[test]
+    fn monocolored_creature() {
+        let (f, rest) = parse_type_phrase("monocolored creature");
+        assert!(rest.trim().is_empty(), "remainder: '{rest}'");
+        assert_eq!(
+            f,
+            TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::ColorCount {
+                    comparator: Comparator::EQ,
+                    count: 1,
+                }])
+            )
+        );
     }
 
     #[test]
@@ -4093,7 +4133,10 @@ mod tests {
         assert!(rest.trim().is_empty(), "remainder: '{rest}'");
         assert_eq!(
             f,
-            TargetFilter::Typed(TypedFilter::card().properties(vec![FilterProp::Multicolored]))
+            TargetFilter::Typed(TypedFilter::card().properties(vec![FilterProp::ColorCount {
+                comparator: Comparator::GE,
+                count: 2,
+            }]))
         );
     }
 

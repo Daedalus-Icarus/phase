@@ -1493,10 +1493,13 @@ pub enum FilterProp {
     /// CR 509.1b: Matches objects whose power is strictly greater than the source object's power.
     /// Used for "creatures with greater power" blocking restrictions (relative comparison).
     PowerGTSource,
-    /// Matches multicolored objects (2+ colors).
-    Multicolored,
-    /// CR 105.2c: Matches colorless objects (0 colors).
-    Colorless,
+    /// CR 105.2: Matches objects by color-set size. Covers colorless
+    /// (0 colors), monocolored (exactly 1 color), and multicolored
+    /// (2 or more colors) without proliferating sibling variants.
+    ColorCount {
+        comparator: Comparator,
+        count: u8,
+    },
     /// Matches objects with a specific supertype (Basic, Legendary, Snow).
     HasSupertype {
         value: Supertype,

@@ -415,7 +415,15 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             FilterProp::HasColor { color } => parts.push(format!("{color:?}").to_lowercase()),
             FilterProp::PowerLE { value } => parts.push(format!("power ≤{}", fmt_quantity(value))),
             FilterProp::PowerGE { value } => parts.push(format!("power ≥{}", fmt_quantity(value))),
-            FilterProp::Multicolored => parts.push("multicolored".into()),
+            FilterProp::ColorCount { comparator, count } => {
+                let label = match (comparator, count) {
+                    (Comparator::EQ, 0) => "colorless".into(),
+                    (Comparator::EQ, 1) => "monocolored".into(),
+                    (Comparator::GE, 2) => "multicolored".into(),
+                    _ => format!("colors {comparator:?} {count}").to_lowercase(),
+                };
+                parts.push(label);
+            }
             FilterProp::HasSupertype { value } => {
                 parts.push(format!("{value}").to_lowercase());
             }
@@ -481,7 +489,6 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                 parts.push(format!("targets {}", fmt_target(filter)));
             }
             FilterProp::Named { name } => parts.push(format!("named \"{name}\"")),
-            FilterProp::Colorless => parts.push("colorless".into()),
             FilterProp::IsChosenColor => parts.push("chosen color".into()),
             FilterProp::PowerGTSource => parts.push("power > source".into()),
             FilterProp::ToughnessLE { value } => {
