@@ -4,7 +4,7 @@
 //! against the current game state at resolution time. Used by effect resolvers
 //! to support "for each [X]" patterns on Draw, DealDamage, GainLife, LoseLife, Mill.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::game::arithmetic::{u32_to_i32_saturating, usize_to_i32_saturating};
 use crate::game::filter::{
@@ -1299,6 +1299,32 @@ fn resolve_ref(
                 })
                 .count(),
         ),
+        QuantityRef::MaxDamageDealtThisTurnBySourceControlledBy {
+            controller: source_controller,
+        } => {
+            let mut totals: HashMap<ObjectId, u32> = HashMap::new();
+            for record in &state.damage_dealt_this_turn {
+                if damage_source_controller_matches(
+                    state,
+                    record.source_controller,
+                    controller,
+                    ctx,
+                    ability,
+                    source_controller,
+                ) {
+                    totals
+                        .entry(record.source_id)
+                        .and_modify(|total| *total = total.saturating_add(record.amount))
+                        .or_insert(record.amount);
+                }
+            }
+            totals
+                .values()
+                .copied()
+                .max()
+                .map(u32_to_i32_saturating)
+                .unwrap_or(0)
+        }
         // CR 500: Cumulative turns taken by this player.
         QuantityRef::TurnsTaken => player.map_or(0, |p| u32_to_i32_saturating(p.turns_taken)),
         // Chosen number stored on the source object via ChosenAttribute::Number.
@@ -1474,6 +1500,33 @@ fn scoped_player_or_controller(
     ability
         .and_then(|ability| ability.scoped_player)
         .unwrap_or(controller)
+}
+
+fn damage_source_controller_matches(
+    state: &GameState,
+    actual: PlayerId,
+    controller: PlayerId,
+    ctx: QuantityContext,
+    ability: Option<&ResolvedAbility>,
+    expected: &ControllerRef,
+) -> bool {
+    match expected {
+        ControllerRef::You => actual == controller,
+        ControllerRef::Opponent => actual != controller,
+        ControllerRef::ScopedPlayer => actual == scoped_player_or_controller(ability, controller),
+        ControllerRef::TargetPlayer => ability
+            .and_then(|ability| {
+                ability.targets.iter().find_map(|target| match target {
+                    TargetRef::Player(player) => Some(*player),
+                    TargetRef::Object(_) => None,
+                })
+            })
+            .is_some_and(|player| actual == player),
+        ControllerRef::DefendingPlayer => {
+            crate::game::combat::defending_player_for_attacker(state, ctx.source)
+                .is_some_and(|player| actual == player)
+        }
+    }
 }
 
 /// Check if an object matches a set of type filters for zone card counting.
@@ -2084,13 +2137,13 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{
         AggregateFunction, ChoiceValue, ControllerRef, DevotionColors, Effect, FilterProp,
-        KickerVariant, ObjectProperty, TargetFilter, TypeFilter, TypedFilter,
+        KickerVariant, ObjectProperty, TargetFilter, TargetRef, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::counter::CounterType;
     use crate::types::events::PlayerActionKind;
     use crate::types::game_state::{
-        ExileLink, ExileLinkKind, ManaSpentSourceSnapshot, ZoneChangeRecord,
+        DamageRecord, ExileLink, ExileLinkKind, ManaSpentSourceSnapshot, ZoneChangeRecord,
     };
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::keywords::Keyword;
@@ -2952,6 +3005,77 @@ mod tests {
             },
         };
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 1);
+    }
+
+    #[test]
+    fn resolve_max_damage_dealt_this_turn_groups_by_source_controller() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1000),
+            PlayerId(0),
+            "Dragon Cultist".to_string(),
+            Zone::Battlefield,
+        );
+        let p0_source = create_object(
+            &mut state,
+            CardId(1001),
+            PlayerId(0),
+            "Lightning Rig".to_string(),
+            Zone::Battlefield,
+        );
+        let p0_other_source = create_object(
+            &mut state,
+            CardId(1002),
+            PlayerId(0),
+            "Spark Rig".to_string(),
+            Zone::Battlefield,
+        );
+        let p1_source = create_object(
+            &mut state,
+            CardId(1003),
+            PlayerId(1),
+            "Opposing Rig".to_string(),
+            Zone::Battlefield,
+        );
+        state.damage_dealt_this_turn.extend([
+            DamageRecord {
+                source_id: p0_source,
+                source_controller: PlayerId(0),
+                target: TargetRef::Player(PlayerId(1)),
+                amount: 3,
+                is_combat: false,
+            },
+            DamageRecord {
+                source_id: p0_source,
+                source_controller: PlayerId(0),
+                target: TargetRef::Player(PlayerId(1)),
+                amount: 2,
+                is_combat: false,
+            },
+            DamageRecord {
+                source_id: p0_other_source,
+                source_controller: PlayerId(0),
+                target: TargetRef::Player(PlayerId(1)),
+                amount: 4,
+                is_combat: false,
+            },
+            DamageRecord {
+                source_id: p1_source,
+                source_controller: PlayerId(1),
+                target: TargetRef::Player(PlayerId(0)),
+                amount: 9,
+                is_combat: false,
+            },
+        ]);
+
+        let expr = QuantityExpr::Ref {
+            qty: QuantityRef::MaxDamageDealtThisTurnBySourceControlledBy {
+                controller: ControllerRef::You,
+            },
+        };
+        assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 5);
+        assert_eq!(resolve_quantity(&state, &expr, PlayerId(1), source), 9);
     }
 
     // CR 603.10a + CR 603.6e: Hateful Eidolon's "for each Aura you controlled that

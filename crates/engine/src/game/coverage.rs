@@ -897,6 +897,9 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 fmt_target(filter)
             )
         }
+        QuantityRef::MaxDamageDealtThisTurnBySourceControlledBy { controller } => {
+            format!("max damage this turn by {controller:?} source")
+        }
         QuantityRef::TurnsTaken => "turns taken".into(),
         QuantityRef::ChosenNumber => "chosen number".into(),
         QuantityRef::AttackedThisTurn => "attacked this turn".into(),
@@ -2876,7 +2879,12 @@ pub fn analyze_coverage(card_db: &CardDatabase) -> CoverageSummary {
         check_keywords(&face.keywords, &mut missing);
 
         // Check static abilities
-        check_statics(&face.static_abilities, &static_registry, &mut missing);
+        check_statics(
+            &face.static_abilities,
+            &trigger_registry,
+            &static_registry,
+            &mut missing,
+        );
 
         // Check replacements
         check_replacements(&face.replacements, &mut missing);
@@ -3278,6 +3286,18 @@ pub fn card_face_has_unimplemented_parts(face: &CardFace) -> bool {
 
 fn static_has_unimplemented_parts(def: &StaticDefinition) -> bool {
     matches!(def.condition, Some(StaticCondition::Unrecognized { .. }))
+        || def
+            .modifications
+            .iter()
+            .any(|modification| match modification {
+                ContinuousModification::GrantAbility { definition } => {
+                    ability_definition_has_unimplemented_parts(definition)
+                }
+                ContinuousModification::GrantTrigger { trigger } => {
+                    trigger_has_unimplemented_parts(trigger)
+                }
+                _ => false,
+            })
 }
 
 /// Returns the list of unsupported handler labels for a card face (e.g.
@@ -3290,7 +3310,12 @@ pub fn card_face_gaps(face: &CardFace) -> Vec<String> {
     check_keywords(&face.keywords, &mut missing);
     check_abilities(&face.abilities, &mut missing);
     check_triggers(&face.triggers, &trigger_registry, &mut missing);
-    check_statics(&face.static_abilities, &static_registry, &mut missing);
+    check_statics(
+        &face.static_abilities,
+        &trigger_registry,
+        &static_registry,
+        &mut missing,
+    );
     check_additional_cost(&face.additional_cost, &mut missing);
     check_replacements(&face.replacements, &mut missing);
     missing
@@ -3316,20 +3341,7 @@ fn check_triggers(
     missing: &mut Vec<String>,
 ) {
     for def in triggers {
-        if let Some(execute) = &def.execute {
-            collect_ability_missing_parts(execute, missing);
-        }
-        // CR 603.8: StateCondition triggers are handled by the priority pipeline
-        // (check_state_triggers), not the event-based trigger registry. They are supported.
-        if matches!(&def.mode, TriggerMode::Unknown(_))
-            || (!trigger_registry.contains_key(&def.mode)
-                && !matches!(&def.mode, TriggerMode::StateCondition))
-        {
-            let label = format!("Trigger:{}", def.mode);
-            if !missing.contains(&label) {
-                missing.push(label);
-            }
-        }
+        check_trigger(def, trigger_registry, missing);
     }
 }
 
@@ -3352,6 +3364,7 @@ fn check_additional_cost(additional_cost: &Option<AdditionalCost>, missing: &mut
 
 fn check_statics(
     statics: &[StaticDefinition],
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
     static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
     missing: &mut Vec<String>,
 ) {
@@ -3369,6 +3382,38 @@ fn check_statics(
             if !missing.contains(&label) {
                 missing.push(label);
             }
+        }
+        for modification in &def.modifications {
+            match modification {
+                ContinuousModification::GrantAbility { definition } => {
+                    collect_ability_missing_parts(definition, missing);
+                }
+                ContinuousModification::GrantTrigger { trigger } => {
+                    check_trigger(trigger, trigger_registry, missing);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn check_trigger(
+    trigger: &TriggerDefinition,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    missing: &mut Vec<String>,
+) {
+    if let Some(execute) = &trigger.execute {
+        collect_ability_missing_parts(execute, missing);
+    }
+    // CR 603.8: StateCondition triggers are handled by the priority pipeline
+    // (check_state_triggers), not the event-based trigger registry. They are supported.
+    if matches!(&trigger.mode, TriggerMode::Unknown(_))
+        || (!trigger_registry.contains_key(&trigger.mode)
+            && !matches!(&trigger.mode, TriggerMode::StateCondition))
+    {
+        let label = format!("Trigger:{}", trigger.mode);
+        if !missing.contains(&label) {
+            missing.push(label);
         }
     }
 }
@@ -3621,6 +3666,10 @@ fn ability_definition_has_unimplemented_parts(def: &AbilityDefinition) -> bool {
             .as_ref()
             .is_some_and(|sub| ability_definition_has_unimplemented_parts(sub))
         || def
+            .else_ability
+            .as_ref()
+            .is_some_and(|else_ability| ability_definition_has_unimplemented_parts(else_ability))
+        || def
             .mode_abilities
             .iter()
             .any(ability_definition_has_unimplemented_parts)
@@ -3663,6 +3712,10 @@ fn collect_ability_missing_parts(def: &AbilityDefinition, missing: &mut Vec<Stri
 
     if let Some(sub_ability) = &def.sub_ability {
         collect_ability_missing_parts(sub_ability, missing);
+    }
+
+    if let Some(else_ability) = &def.else_ability {
+        collect_ability_missing_parts(else_ability, missing);
     }
 
     for mode_ability in &def.mode_abilities {
@@ -4174,7 +4227,7 @@ fn is_card_supported(
     }
     // Check statics
     for stat in &face.static_abilities {
-        if !static_registry.contains_key(&stat.mode) && !is_data_carrying_static(&stat.mode) {
+        if !is_static_supported(stat, trigger_registry, static_registry) {
             return false;
         }
     }
@@ -4193,6 +4246,40 @@ fn is_card_supported(
         }
     }
     true
+}
+
+fn is_static_supported(
+    stat: &StaticDefinition,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+) -> bool {
+    (static_registry.contains_key(&stat.mode) || is_data_carrying_static(&stat.mode))
+        && !matches!(stat.condition, Some(StaticCondition::Unrecognized { .. }))
+        && stat
+            .modifications
+            .iter()
+            .all(|modification| match modification {
+                ContinuousModification::GrantAbility { definition } => {
+                    is_ability_supported(definition)
+                }
+                ContinuousModification::GrantTrigger { trigger } => {
+                    is_trigger_supported(trigger, trigger_registry)
+                }
+                _ => true,
+            })
+}
+
+fn is_trigger_supported(
+    trigger: &TriggerDefinition,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+) -> bool {
+    if matches!(&trigger.mode, TriggerMode::Unknown(_))
+        || (!trigger_registry.contains_key(&trigger.mode)
+            && !matches!(&trigger.mode, TriggerMode::StateCondition))
+    {
+        return false;
+    }
+    trigger.execute.as_deref().is_none_or(is_ability_supported)
 }
 
 /// Check if an ability definition tree has any Unimplemented effects.
@@ -4649,6 +4736,9 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::LifeGainedThisTurn { .. } => ("LifeGainedThisTurn", Handled),
         QuantityRef::CardsDrawnThisTurn { .. } => ("CardsDrawnThisTurn", Handled),
         QuantityRef::ZoneChangeCountThisTurn { .. } => ("ZoneChangeCountThisTurn", Handled),
+        QuantityRef::MaxDamageDealtThisTurnBySourceControlledBy { .. } => {
+            ("MaxDamageDealtThisTurnBySourceControlledBy", Handled)
+        }
         QuantityRef::TurnsTaken => ("TurnsTaken", Unhandled),
         QuantityRef::ChosenNumber => ("ChosenNumber", Unhandled),
         QuantityRef::AttackedThisTurn => ("AttackedThisTurn", Handled),

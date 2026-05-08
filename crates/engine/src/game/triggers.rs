@@ -5187,6 +5187,7 @@ pub mod tests {
         // Record damage: source dealt 3 damage to dying_creature
         state.damage_dealt_this_turn.push(DamageRecord {
             source_id: source,
+            source_controller: PlayerId(0),
             target: TargetRef::Object(dying_creature),
             amount: 3,
             is_combat: false,
@@ -5245,6 +5246,7 @@ pub mod tests {
         let mut state = setup();
         state.damage_dealt_this_turn.push(DamageRecord {
             source_id: ObjectId(1),
+            source_controller: PlayerId(0),
             target: TargetRef::Object(ObjectId(2)),
             amount: 2,
             is_combat: true,

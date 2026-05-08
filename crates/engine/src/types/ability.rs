@@ -2321,6 +2321,11 @@ pub enum QuantityRef {
         to: Option<Zone>,
         filter: TargetFilter,
     },
+    /// CR 120.1 + CR 603.4: Greatest total damage dealt this turn by any one
+    /// source controlled by the referenced player. Used by intervening-if
+    /// phrases such as "if a source you controlled dealt 5 or more damage this
+    /// turn"; damage from multiple sources is not combined.
+    MaxDamageDealtThisTurnBySourceControlledBy { controller: ControllerRef },
     /// A number chosen as the source entered the battlefield (e.g., Talion, the Kindly Lord).
     /// Resolved from the source object's `ChosenAttribute::Number`.
     ChosenNumber,

@@ -1750,18 +1750,7 @@ fn evaluate_replacement_condition(
             if let Some(affected_id) = affected_object_id {
                 state.damage_dealt_this_turn.iter().any(|record| {
                     record.target == TargetRef::Object(affected_id)
-                        && state
-                            .objects
-                            .get(&record.source_id)
-                            .map(|src| src.controller)
-                            .or_else(|| {
-                                // Source may have left the battlefield; check LKI cache.
-                                state
-                                    .lki_cache
-                                    .get(&record.source_id)
-                                    .map(|lki| lki.controller)
-                            })
-                            .is_some_and(|c| c == required_controller)
+                        && record.source_controller == required_controller
                 })
             } else {
                 false

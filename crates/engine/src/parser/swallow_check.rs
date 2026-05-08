@@ -447,6 +447,23 @@ fn def_tree_has_unimplemented(def: &AbilityDefinition) -> bool {
     def.mode_abilities.iter().any(def_tree_has_unimplemented)
 }
 
+fn trigger_tree_has_unimplemented(trigger: &TriggerDefinition) -> bool {
+    trigger
+        .execute
+        .as_deref()
+        .is_some_and(def_tree_has_unimplemented)
+}
+
+fn static_definition_has_unimplemented(s: &StaticDefinition) -> bool {
+    s.modifications.iter().any(|m| match m {
+        ContinuousModification::GrantTrigger { trigger } => trigger_tree_has_unimplemented(trigger),
+        ContinuousModification::GrantAbility { definition } => {
+            def_tree_has_unimplemented(definition)
+        }
+        _ => false,
+    })
+}
+
 fn any_ability_has_unimplemented(parsed: &ParsedAbilities) -> bool {
     parsed.abilities.iter().any(def_tree_has_unimplemented)
         || parsed
@@ -457,6 +474,7 @@ fn any_ability_has_unimplemented(parsed: &ParsedAbilities) -> bool {
             .replacements
             .iter()
             .any(|r| r.execute.as_deref().is_some_and(def_tree_has_unimplemented))
+        || parsed.statics.iter().any(static_definition_has_unimplemented)
         // CR 603: A `TriggerMode::Unknown(_)` is the trigger-side equivalent
         // of `Effect::Unimplemented` — the parser preserved the original
         // trigger text but couldn't classify the timing/event. Suppress
@@ -1513,6 +1531,7 @@ fn detect_duration_this_turn(
         "YouHadCreatureEnterThisTurn",
         "YouHadAngelOrBerserkerEnterThisTurn",
         "YouHadArtifactEnterThisTurn",
+        "EnteredThisTurn",
         "CardsLeftYourGraveyardThisTurnAtLeast",
         "SourceEnteredThisTurn",
         "OpponentSearchedLibraryThisTurn",
@@ -1926,6 +1945,18 @@ mod tests {
     }
 
     #[test]
+    fn duration_this_turn_accepts_entered_this_turn_quantity_condition() {
+        let parsed = parse_named(
+            "Reach\n\
+             This creature gets +1/+0 and has trample as long as you control a land creature or a land entered the battlefield under your control this turn.",
+            "Earth Rumble Wrestlers",
+            &["Creature"],
+        );
+
+        assert!(!has_swallowed_detector(&parsed, "Duration_ThisTurn"));
+    }
+
+    #[test]
     fn optional_you_may_accepts_delayed_trigger_inner_optionality() {
         let parsed = parse(
             "Whenever a creature enters this turn, you may draw a card.",
@@ -1940,6 +1971,17 @@ mod tests {
         let parsed = parse(
             "Put a +1/+1 counter on target creature you control, then double the number of +1/+1 counters on that creature.",
             &["Instant"],
+        );
+
+        assert!(!has_swallowed_detector(&parsed, "DynamicQty"));
+    }
+
+    #[test]
+    fn dynamic_qty_suppressed_for_unimplemented_granted_trigger_child() {
+        let parsed = parse_named(
+            "Commander creatures you own have \"When this creature enters and at the beginning of your upkeep, each player may put two +1/+1 counters on a creature they control. For each opponent who does, you gain protection from that player until your next turn.\"",
+            "Noble Heritage",
+            &["Enchantment"],
         );
 
         assert!(!has_swallowed_detector(&parsed, "DynamicQty"));

@@ -402,6 +402,8 @@ pub struct ChosenDamageSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DamageRecord {
     pub source_id: ObjectId,
+    #[serde(default)]
+    pub source_controller: PlayerId,
     pub target: TargetRef,
     pub amount: u32,
     #[serde(default)]

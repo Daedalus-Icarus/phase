@@ -385,6 +385,7 @@ pub(crate) fn apply_damage_after_replacement(
     if actual_amount > 0 {
         state.damage_dealt_this_turn.push(DamageRecord {
             source_id: ctx.source_id,
+            source_controller: ctx.controller,
             target: t.clone(),
             amount: actual_amount,
             is_combat,

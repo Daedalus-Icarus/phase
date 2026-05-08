@@ -75,6 +75,7 @@ fn parse_state_presence_conditions(input: &str) -> OracleResult<'_, StaticCondit
 
 fn parse_event_history_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((
+        parse_source_damage_threshold_this_turn,
         parse_entered_this_turn,
         parse_opponent_cast_spell_this_turn,
         parse_youve_this_turn,
@@ -1384,6 +1385,7 @@ fn parse_event_state_conditions(input: &str) -> OracleResult<'_, StaticCondition
 
 fn parse_zone_history_condition(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((
+        parse_card_put_into_your_graveyard_from_anywhere_this_turn,
         parse_creature_died_this_turn_conditions,
         // "a nonland permanent left the battlefield this turn" (Revolt variant)
         value(
@@ -1417,6 +1419,59 @@ fn parse_zone_history_condition(input: &str) -> OracleResult<'_, StaticCondition
         parse_you_sacrificed_this_turn,
     ))
     .parse(input)
+}
+
+fn parse_card_put_into_your_graveyard_from_anywhere_this_turn(
+    input: &str,
+) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = parse_article(input)?;
+    let suffix = " card was put into your graveyard from anywhere this turn";
+    let (rest, type_text) = take_until(suffix).parse(rest)?;
+    let (rest, _) = tag(suffix).parse(rest)?;
+    let (filter, leftover) = parse_type_phrase(type_text.trim());
+    if !leftover.trim().is_empty() || filter == TargetFilter::Any {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    }
+
+    Ok((
+        rest,
+        make_quantity_ge(
+            QuantityRef::ZoneChangeCountThisTurn {
+                from: None,
+                to: Some(Zone::Graveyard),
+                filter: add_owned_you_non_token(filter),
+            },
+            1,
+        ),
+    ))
+}
+
+fn add_owned_you_non_token(filter: TargetFilter) -> TargetFilter {
+    match filter {
+        TargetFilter::Typed(mut typed) => {
+            if !typed
+                .properties
+                .iter()
+                .any(|prop| matches!(prop, FilterProp::Owned { .. }))
+            {
+                typed.properties.push(FilterProp::Owned {
+                    controller: ControllerRef::You,
+                });
+            }
+            if !typed
+                .properties
+                .iter()
+                .any(|prop| matches!(prop, FilterProp::NonToken))
+            {
+                typed.properties.push(FilterProp::NonToken);
+            }
+            TargetFilter::Typed(typed)
+        }
+        other => other,
+    }
 }
 
 fn parse_life_history_condition(input: &str) -> OracleResult<'_, StaticCondition> {
@@ -1465,6 +1520,27 @@ fn parse_life_history_condition(input: &str) -> OracleResult<'_, StaticCondition
         parse_you_gained_life_this_turn,
     ))
     .parse(input)
+}
+
+fn parse_source_damage_threshold_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = parse_article(input)?;
+    let (rest, _) = tag("source ").parse(rest)?;
+    let (rest, controller) = alt((
+        value(ControllerRef::You, tag("you controlled")),
+        value(ControllerRef::Opponent, tag("an opponent controlled")),
+    ))
+    .parse(rest)?;
+    let (rest, _) = tag(" dealt ").parse(rest)?;
+    let (rest, amount) = parse_number(rest)?;
+    let (rest, _) = tag(" or more damage this turn").parse(rest)?;
+
+    Ok((
+        rest,
+        make_quantity_ge(
+            QuantityRef::MaxDamageDealtThisTurnBySourceControlledBy { controller },
+            amount,
+        ),
+    ))
 }
 
 fn parse_discard_history_condition(input: &str) -> OracleResult<'_, StaticCondition> {
@@ -5358,6 +5434,45 @@ mod tests {
     }
 
     #[test]
+    fn test_card_put_into_your_graveyard_from_anywhere_this_turn() {
+        let (rest, c) = parse_inner_condition(
+            "a creature card was put into your graveyard from anywhere this turn",
+        )
+        .unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::ZoneChangeCountThisTurn {
+                                from: None,
+                                to: Some(Zone::Graveyard),
+                                filter: TargetFilter::Typed(filter),
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            } => {
+                assert!(filter.type_filters.contains(&TypeFilter::Creature));
+                assert!(filter.properties.iter().any(|property| matches!(
+                    property,
+                    FilterProp::Owned {
+                        controller: ControllerRef::You
+                    }
+                )));
+                assert!(filter
+                    .properties
+                    .iter()
+                    .any(|property| matches!(property, FilterProp::NonToken)));
+            }
+            other => {
+                panic!("expected owned creature-card graveyard zone-change count, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
     fn test_creature_left_battlefield_under_your_control() {
         let (rest, c) =
             parse_inner_condition("a creature left the battlefield under your control this turn")
@@ -5469,6 +5584,28 @@ mod tests {
                 assert_eq!(rhs, QuantityExpr::Fixed { value: 1 });
             }
             _ => panic!("expected QuantityComparison, got {c:?}"),
+        }
+    }
+
+    #[test]
+    fn test_source_you_controlled_dealt_damage_threshold_this_turn() {
+        let (rest, c) =
+            parse_inner_condition("a source you controlled dealt 5 or more damage this turn")
+                .unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::MaxDamageDealtThisTurnBySourceControlledBy {
+                                controller: ControllerRef::You,
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 5 },
+            } => {}
+            other => panic!("expected source-damage threshold quantity, got {other:?}"),
         }
     }
 
