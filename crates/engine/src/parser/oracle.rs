@@ -1508,30 +1508,13 @@ pub(crate) fn parse_oracle_ir(
         if let Some(colon_pos) = find_activated_colon(&line) {
             let cost_text = line[..colon_pos].trim();
             let effect_text = line[colon_pos + 1..].trim();
-            let (effect_text, constraints) = strip_activated_constraints(effect_text);
-            // Normalize card name in cost text (e.g., "Exile Wilson from your graveyard" → "Exile ~ from your graveyard")
-            let normalized_cost_text = normalize_self_refs_for_static(cost_text, card_name);
-            let cost = parse_oracle_cost(&normalized_cost_text);
-
-            // Retry with `~` normalization if the first pass left an
-            // Unimplemented node or emitted a `target-fallback` warning
-            // (Metalhead class: PutCounter silently fell back to `Any`).
-            let mut def = parse_activated_with_self_ref_fallback(&effect_text, card_name, &mut ctx);
-            normalize_activated_mana_instead_delta(&mut def);
-            if def.activation_zone.is_none() {
-                def.activation_zone = activation_zone_from_self_cost(&cost);
-            }
-            def.cost = Some(cost);
-            def.description = Some(line.to_string());
-            if constraints.sorcery_speed() {
-                def.sorcery_speed = true;
-            }
-            if !constraints.restrictions.is_empty() {
-                def.activation_restrictions = constraints.restrictions;
-            }
-            // CR 601.2f: Extract self-referential cost reduction from the terminal
-            // sub_ability in the chain (may be several levels deep).
-            extract_cost_reduction_from_chain(&mut def);
+            let (mut def, effect_text) = parse_activated_ability_definition(
+                cost_text,
+                effect_text,
+                &line,
+                card_name,
+                &mut ctx,
+            );
             i += 1;
             // CR 706: If the activated ability ends with "roll a dN", consume
             // subsequent d20 table lines and attach them as die result branches.
@@ -1598,12 +1581,30 @@ pub(crate) fn parse_oracle_ir(
             continue;
         }
 
-        // Priority 6b: Ability-word-prefixed triggers (e.g., "Heroic — Whenever ...",
-        // "Constellation — Whenever ..."). Must intercept BEFORE is_static_pattern and
-        // is_replacement_pattern checks, which would otherwise match on keywords like
-        // "prevent" in the effect text and misroute the line.
+        // Priority 6b: Ability-word-prefixed activated abilities/triggers (e.g.,
+        // "Threshold — {T}: ...", "Heroic — Whenever ..."). Must intercept BEFORE
+        // is_static_pattern and is_replacement_pattern checks, which would otherwise
+        // match on keywords like "gets" or "prevent" in the effect text and misroute
+        // the line.
         if let Some((aw_name, effect_text)) = strip_ability_word_with_name(&line) {
             let effect_lower = effect_text.to_lowercase();
+            let aw_condition = ability_word_to_condition(&aw_name);
+            if aw_condition.is_some() {
+                if let Some(colon_pos) = find_activated_colon(&effect_text) {
+                    let cost_text = effect_text[..colon_pos].trim();
+                    let activated_effect_text = effect_text[colon_pos + 1..].trim();
+                    let (def, _) = parse_activated_ability_definition(
+                        cost_text,
+                        activated_effect_text,
+                        &line,
+                        card_name,
+                        &mut ctx,
+                    );
+                    result.abilities.push(def);
+                    i += 1;
+                    continue;
+                }
+            }
             if has_trigger_prefix(&effect_lower) {
                 // CR 707.9a: Thread the running trigger count as the base index.
                 let mut triggers = parse_trigger_lines_at_index(
@@ -2411,6 +2412,36 @@ fn activation_zone_from_self_cost(cost: &AbilityCost) -> Option<Zone> {
         AbilityCost::Composite { costs } => costs.iter().find_map(activation_zone_from_self_cost),
         _ => None,
     }
+}
+
+fn parse_activated_ability_definition(
+    cost_text: &str,
+    effect_text: &str,
+    description: &str,
+    card_name: &str,
+    ctx: &mut ParseContext,
+) -> (AbilityDefinition, String) {
+    let (effect_text, constraints) = strip_activated_constraints(effect_text);
+    let normalized_cost_text = normalize_self_refs_for_static(cost_text, card_name);
+    let cost = parse_oracle_cost(&normalized_cost_text);
+
+    // Retry with `~` normalization if the first pass left an Unimplemented node
+    // or emitted a target-fallback warning.
+    let mut def = parse_activated_with_self_ref_fallback(&effect_text, card_name, ctx);
+    normalize_activated_mana_instead_delta(&mut def);
+    if def.activation_zone.is_none() {
+        def.activation_zone = activation_zone_from_self_cost(&cost);
+    }
+    def.cost = Some(cost);
+    def.description = Some(description.to_string());
+    if constraints.sorcery_speed() {
+        def.sorcery_speed = true;
+    }
+    if !constraints.restrictions.is_empty() {
+        def.activation_restrictions = constraints.restrictions;
+    }
+    extract_cost_reduction_from_chain(&mut def);
+    (def, effect_text)
 }
 
 /// Convert a `ParsedAbilities` into an `OracleDocIr` using `PreLowered*` variants.
@@ -4959,6 +4990,51 @@ mod tests {
             }
             other => panic!("expected Forest ReturnToHand cost, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ability_word_prefixed_activated_ability_preserves_restrictions() {
+        let r = parse(
+            "Threshold — Put three cards from your graveyard on the bottom of your library: This creature gets +3/+3 until end of turn. Activate only once each turn and only if there are seven or more cards in your graveyard.",
+            "Test Scrounger",
+            &[],
+            &["Creature"],
+            &[],
+        );
+
+        assert_eq!(r.abilities.len(), 1);
+        let ability = &r.abilities[0];
+        assert_eq!(ability.kind, AbilityKind::Activated);
+        assert!(matches!(
+            ability.cost.as_ref(),
+            Some(AbilityCost::EffectCost { effect })
+                if matches!(effect.as_ref(), Effect::PutAtLibraryPosition { .. })
+        ));
+        assert!(matches!(
+            ability.effect.as_ref(),
+            Effect::Pump {
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ));
+        assert!(ability.condition.is_none());
+        assert!(ability
+            .activation_restrictions
+            .iter()
+            .any(|restriction| matches!(restriction, ActivationRestriction::OnlyOnceEachTurn)));
+        assert!(ability.activation_restrictions.iter().any(|restriction| {
+            matches!(
+                restriction,
+                ActivationRestriction::RequiresCondition {
+                    condition: Some(
+                        crate::types::ability::ParsedCondition::ZoneCardCountAtLeast {
+                            zone: Zone::Graveyard,
+                            count: 7
+                        }
+                    )
+                }
+            )
+        }));
     }
 
     #[test]
