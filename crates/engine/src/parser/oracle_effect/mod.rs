@@ -24324,6 +24324,87 @@ mod tests {
         );
     }
 
+    /// CR 701.20a: GitHub #318 — Hermit Druid regression. The compound clause
+    /// "Put that card into your hand and all other cards revealed this way
+    /// into your graveyard." must lower `rest_destination=Graveyard`. Prior
+    /// behavior only recognized "the rest" as the rest-pile subject and
+    /// silently defaulted to `Library`, sending revealed cards to the bottom
+    /// instead of the graveyard.
+    #[test]
+    fn reveal_until_hermit_druid_all_other_cards_to_graveyard() {
+        let def = parse_effect_chain(
+            "Reveal cards from the top of your library until you reveal a basic land card. Put that card into your hand and all other cards revealed this way into your graveyard.",
+            AbilityKind::Activated,
+        );
+        assert!(
+            matches!(
+                &*def.effect,
+                Effect::RevealUntil {
+                    kept_destination: Zone::Hand,
+                    rest_destination: Zone::Graveyard,
+                    ..
+                }
+            ),
+            "expected Hermit Druid kept=Hand rest=Graveyard, got: {:?}",
+            def.effect
+        );
+    }
+
+    /// CR 701.20a: Building-block coverage for the rest-pile-subject + zone
+    /// matrix in `RevealUntil` continuations. Exercises three rest-subject
+    /// phrasings ("the rest", "all other cards", "the other cards") across
+    /// three destination zones (Graveyard, Library, Exile) — covers Hermit
+    /// Druid (#318), Avenging Druid, Demonic Consultation, Sacred Guide,
+    /// Spoils of the Vault, Reviving Vapors, and the broader
+    /// `parse_reveal_until_rest_zone` helper surface.
+    #[test]
+    fn reveal_until_rest_subject_destination_matrix() {
+        let cases: &[(&str, Zone)] = &[
+            // "all other cards" + graveyard (Hermit Druid, Avenging Druid,
+            // Gamekeeper, Oath of Druids, Mirror-Mad Phantasm).
+            (
+                "Reveal cards from the top of your library until you reveal a creature card. Put that card into your hand and all other cards revealed this way into your graveyard.",
+                Zone::Graveyard,
+            ),
+            // "exile all other cards" — Aesthetic Consultation, Demonic
+            // Consultation, Divining Witch, Sacred Guide.
+            (
+                "Reveal cards from the top of your library until you reveal a white card. Put that card into your hand and exile all other cards revealed this way.",
+                Zone::Exile,
+            ),
+            // Standalone second-sentence "Exile all other cards revealed
+            // this way." — Spoils of the Vault.
+            (
+                "Reveal cards from the top of your library until you reveal a card with the chosen name. Put that card into your hand. Exile all other cards revealed this way.",
+                Zone::Exile,
+            ),
+            // "the rest" + graveyard — pre-existing canonical phrasing.
+            (
+                "Reveal cards from the top of your library until you reveal a creature card. Put that card into your hand and the rest into your graveyard.",
+                Zone::Graveyard,
+            ),
+            // "the rest" + library default — pre-existing canonical phrasing.
+            (
+                "Reveal cards from the top of your library until you reveal an artifact card. Put that card onto the battlefield and the rest on the bottom of your library in a random order.",
+                Zone::Library,
+            ),
+        ];
+
+        for (text, expected_rest) in cases {
+            let def = parse_effect_chain(text, AbilityKind::Activated);
+            let actual_rest = match &*def.effect {
+                Effect::RevealUntil {
+                    rest_destination, ..
+                } => *rest_destination,
+                other => panic!("expected RevealUntil, got: {other:?} for text: {text}"),
+            };
+            assert_eq!(
+                actual_rest, *expected_rest,
+                "rest_destination mismatch for text: {text}"
+            );
+        }
+    }
+
     #[test]
     fn reveal_until_nonland_card() {
         let def = parse_effect_chain(

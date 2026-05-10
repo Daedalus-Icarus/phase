@@ -127,6 +127,57 @@ fn parse_rest_cards_reference(input: &str) -> Result<(&str, ()), nom::Err<Oracle
     .parse(input)
 }
 
+/// CR 701.20a: Detect the rest-pile zone in a `RevealUntil` continuation
+/// chunk. The "rest" subject may be phrased as "the rest" / "all other cards
+/// revealed this way" / "the other cards" — and may be governed by an
+/// imperative verb that itself encodes the zone ("exile all other cards
+/// revealed this way" → Exile).
+///
+/// Returns `None` only when no rest-subject phrase is present in `lower`.
+/// When a rest subject is detected but no explicit destination phrase is
+/// found, defaults to `Zone::Library` (covers "on the bottom", "in any
+/// order", "shuffles ... into their library", and the bare "and the rest"
+/// variant). This matches the prior behavior of the kept-card and
+/// standalone-rest arms before consolidation.
+fn parse_reveal_until_rest_zone(lower: &str) -> Option<Zone> {
+    // CR 701.20a: Recognize all rest-subject phrasings used across the
+    // RevealUntil family. "the rest" is the canonical form; "all other cards"
+    // and "the other cards" appear in Hermit Druid, Avenging Druid, Demonic
+    // Consultation, Sacred Guide, Spoils of the Vault, Reviving Vapors, etc.
+    let has_rest_subject = nom_primitives::scan_contains(lower, "the rest")
+        || nom_primitives::scan_contains(lower, "all other cards")
+        || nom_primitives::scan_contains(lower, "other cards revealed this way");
+    if !has_rest_subject {
+        return None;
+    }
+
+    // CR 701.20a: Imperative verb "exile" preceding the rest subject routes
+    // the rest pile to exile (Aesthetic Consultation, Demonic Consultation,
+    // Divining Witch, Sacred Guide, Spoils of the Vault).
+    if nom_primitives::scan_contains(lower, "exile all other cards")
+        || nom_primitives::scan_contains(lower, "exile the rest")
+        || nom_primitives::scan_contains(lower, "exile the other cards")
+    {
+        return Some(Zone::Exile);
+    }
+
+    // Possessive variants for graveyard cover both single-controller
+    // ("your", "their") and multi-controller ("their owners'") forms. The
+    // multi-owner form is used by Dance, Pathetic Marionette where each
+    // opponent's revealed cards return to their respective graveyards.
+    if nom_primitives::scan_contains(lower, "into your graveyard")
+        || nom_primitives::scan_contains(lower, "into their graveyard")
+        || nom_primitives::scan_contains(lower, "into their owners' graveyards")
+    {
+        return Some(Zone::Graveyard);
+    }
+
+    // Default: bottom of library — covers "on the bottom of your library",
+    // "in any order", "shuffles ... into their library", and the bare
+    // "and the rest" with no zone phrase.
+    Some(Zone::Library)
+}
+
 fn parse_choice_partition_destination(
     input: &str,
 ) -> Result<(&str, Zone), nom::Err<OracleError<'_>>> {
@@ -1747,11 +1798,12 @@ pub(super) fn parse_followup_continuation_ast(
             })
         }
         // CR 701.20a: "put that card into your hand / onto the battlefield" after RevealUntil
-        // — overrides kept_destination. Also extracts rest_destination when the compound
-        // sentence includes "and the rest" (the "and" split is suppressed because "the rest"
-        // does not start with a recognized imperative verb). Both bare imperative
-        // ("put that card", second-person reveal-until) and third-person ("the player puts
-        // that card", Polymorph / Proteus Staff / Transmogrify) forms are accepted.
+        // — overrides kept_destination. Also extracts rest_destination from a compound
+        // rest clause merged on "and" (suppressed split because the rest-subject — "the
+        // rest", "all other cards", "the other cards" — does not start with a recognized
+        // imperative verb). Both bare imperative ("put that card", second-person
+        // reveal-until) and third-person ("the player puts that card",
+        // Polymorph / Proteus Staff / Transmogrify) forms are accepted.
         Effect::RevealUntil { .. }
             if nom_primitives::scan_contains(&lower, "put that card")
                 || nom_primitives::scan_contains(&lower, "puts that card")
@@ -1766,19 +1818,7 @@ pub(super) fn parse_followup_continuation_ast(
                     // Default "into your hand"
                     (Zone::Hand, false)
                 };
-            // Also extract rest_destination from compound "and the rest [into zone]"
-            let rest = if nom_primitives::scan_contains(&lower, "the rest") {
-                if nom_primitives::scan_contains(&lower, "into your graveyard")
-                    || nom_primitives::scan_contains(&lower, "into their graveyard")
-                {
-                    Some(Zone::Graveyard)
-                } else {
-                    // "on the bottom of your library in a random order" or similar
-                    Some(Zone::Library)
-                }
-            } else {
-                None
-            };
+            let rest = parse_reveal_until_rest_zone(&lower);
             Some(ContinuationAst::RevealUntilKept {
                 destination,
                 enter_tapped,
@@ -1818,6 +1858,10 @@ pub(super) fn parse_followup_continuation_ast(
         }
         //   • "put the revealed cards" / "put them back" after RevealUntil — the
         //     revealed pile's destination override for the non-matching cards only.
+        //   • "all other cards revealed this way" / "the other cards" / "exile all
+        //     other cards revealed this way" — second-sentence rest clauses for
+        //     Spoils of the Vault, Sacred Guide, Reviving Vapors and the broader
+        //     "all other cards" family.
         Effect::RevealUntil { .. }
             if nom_primitives::scan_contains(&lower, "put the rest")
                 || nom_primitives::scan_contains(&lower, "puts the rest")
@@ -1825,18 +1869,14 @@ pub(super) fn parse_followup_continuation_ast(
                 || nom_primitives::scan_contains(&lower, "the rest into your graveyard")
                 || nom_primitives::scan_contains(&lower, "put the revealed cards")
                 || nom_primitives::scan_contains(&lower, "put them back")
+                || nom_primitives::scan_contains(&lower, "all other cards revealed this way")
+                || nom_primitives::scan_contains(&lower, "other cards revealed this way")
                 || (nom_primitives::scan_contains(&lower, "shuffle")
                     && nom_primitives::scan_contains(&lower, "library")) =>
         {
-            let destination = if nom_primitives::scan_contains(&lower, "into your graveyard")
-                || nom_primitives::scan_contains(&lower, "into their graveyard")
-            {
-                Zone::Graveyard
-            } else {
-                // Default: bottom of library (covers "shuffles into their library",
-                // "on the bottom", and the no-zone "put the rest" variant)
-                Zone::Library
-            };
+            // Delegate to the shared rest-zone matcher so the kept-card and
+            // standalone-rest arms recognize the same destination phrases.
+            let destination = parse_reveal_until_rest_zone(&lower).unwrap_or(Zone::Library);
             Some(ContinuationAst::PutRest {
                 destination,
                 reorder_all: false,
