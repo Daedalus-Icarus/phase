@@ -1886,6 +1886,25 @@ pub(crate) fn compute_current_copiable_values(
                 values: effect_values,
             } => {
                 values = (**effect_values).clone();
+                for trigger in state
+                    .transient_continuous_effects
+                    .iter()
+                    .filter(|tce| {
+                        tce.source_id == effect.source_id
+                            && tce.timestamp == effect.timestamp
+                            && tce.affected == effect.affected_filter
+                    })
+                    .flat_map(|tce| &tce.modifications)
+                    .filter_map(|modification| match modification {
+                        ContinuousModification::GrantTrigger { trigger } => Some(trigger),
+                        _ => None,
+                    })
+                {
+                    let triggers = Arc::make_mut(&mut values.trigger_definitions);
+                    if !triggers.iter().any(|t| t == trigger.as_ref()) {
+                        triggers.push(*trigger.clone());
+                    }
+                }
             }
             // CR 707.9b: Name overrides from "except its name is X" clauses
             // become part of the copiable values of the copy. A subsequent

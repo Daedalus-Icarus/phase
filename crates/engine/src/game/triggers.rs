@@ -4024,6 +4024,62 @@ pub mod tests {
         assert_eq!(pending.controller, PlayerId(0));
     }
 
+    #[test]
+    fn granted_etb_destroy_other_same_name_skips_source_when_no_other_exists() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Copied Creature".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&source).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.entered_battlefield_turn = Some(1);
+            let mut execute = AbilityDefinition::new(
+                AbilityKind::Database,
+                Effect::Destroy {
+                    target: TargetFilter::Typed(
+                        TypedFilter::creature()
+                            .properties(vec![FilterProp::Another, FilterProp::SameName]),
+                    ),
+                    cant_regenerate: false,
+                },
+            );
+            execute.optional_targeting = true;
+            execute.multi_target = Some(MultiTargetSpec::fixed(0, 1));
+            obj.trigger_definitions.push(
+                TriggerDefinition::new(TriggerMode::ChangesZone)
+                    .execute(execute)
+                    .valid_card(TargetFilter::SelfRef)
+                    .destination(Zone::Battlefield),
+            );
+        }
+
+        let events = vec![zone_changed_event(
+            source,
+            Zone::Hand,
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+            Vec::new(),
+        )];
+
+        process_triggers(&mut state, &events);
+
+        let entry = state.stack.back().expect("optional trigger goes on stack");
+        let StackEntryKind::TriggeredAbility { ability, .. } = &entry.kind else {
+            panic!("expected triggered ability, got {:?}", entry.kind);
+        };
+        assert!(
+            ability.targets.is_empty(),
+            "no other same-name creature exists; source must not be auto-targeted"
+        );
+    }
+
     /// CR 115.1b + CR 609: Pit of Offerings — "exile up to three target cards from graveyards."
     /// The trigger carries `multi_target: { min: 0, max: 3 }` on its ChangeZone effect.
     /// `build_target_slots` must surface THREE optional slots so target selection prompts
