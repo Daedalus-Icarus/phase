@@ -260,7 +260,14 @@ fn try_parse_inverted_attached_subject_grant(
 }
 
 fn parse_attached_subject_is_legendary(condition: &TextPair<'_>) -> Option<TargetFilter> {
-    let rest = nom_tag_tp(condition, "equipped ")?;
+    let (rest, attachment_prop) = if let Some(rest) = nom_tag_tp(condition, "equipped ") {
+        (rest, FilterProp::EquippedBy)
+    } else {
+        (
+            nom_tag_tp(condition, "enchanted ")?,
+            FilterProp::EnchantedBy,
+        )
+    };
     let rest = nom_tag_tp(&rest, "creature is legendary")?;
     if !rest.original.trim().is_empty() {
         return None;
@@ -268,7 +275,7 @@ fn parse_attached_subject_is_legendary(condition: &TextPair<'_>) -> Option<Targe
 
     Some(TargetFilter::Typed(TypedFilter::creature().properties(
         vec![
-            FilterProp::EquippedBy,
+            attachment_prop,
             FilterProp::HasSupertype {
                 value: Supertype::Legendary,
             },
@@ -6489,6 +6496,15 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
             modifications.push(ContinuousModification::AddPower { value: p });
             modifications.push(ContinuousModification::AddToughness { value: t });
         }
+    } else if let Some((p, t)) = parse_fixed_pt_in_text(unquoted_tp.lower) {
+        modifications.push(ContinuousModification::AddPower { value: p });
+        modifications.push(ContinuousModification::AddToughness { value: t });
+    }
+
+    if parse_legendary_supertype_grant(unquoted_tp.lower).is_some() {
+        modifications.push(ContinuousModification::AddSupertype {
+            supertype: Supertype::Legendary,
+        });
     }
 
     // CR 510.1c: Aura/Equipment-style compound statics can attach the
@@ -6710,6 +6726,24 @@ fn parse_dynamic_pt_in_text(
     }
 
     Some(mods)
+}
+
+fn parse_fixed_pt_in_text(lower: &str) -> Option<(i32, i32)> {
+    nom_primitives::scan_at_word_boundaries(lower, |input| {
+        let (rest, _) = alt((
+            tag::<_, _, OracleError<'_>>("gets "),
+            tag::<_, _, OracleError<'_>>("get "),
+        ))
+        .parse(input)?;
+        let (rest, pt) = nom_primitives::parse_pt_modifier.parse(rest)?;
+        Ok((rest, pt))
+    })
+}
+
+fn parse_legendary_supertype_grant(lower: &str) -> Option<()> {
+    nom_primitives::scan_at_word_boundaries(lower, |input| {
+        value((), tag::<_, _, OracleError<'_>>("is legendary")).parse(input)
+    })
 }
 
 /// CR 205.1a + CR 205.2 + CR 205.3 + CR 613.1c: Scan text for a "becomes a
@@ -10165,6 +10199,40 @@ mod tests {
     }
 
     #[test]
+    fn static_legendary_gets_and_has_compound() {
+        let def = parse_static_line(
+            "Enchanted creature is legendary, gets +1/+1, and has flying, vigilance, and lifelink.",
+        )
+        .unwrap();
+        assert!(def
+            .modifications
+            .contains(&ContinuousModification::AddSupertype {
+                supertype: Supertype::Legendary,
+            }));
+        assert!(def
+            .modifications
+            .contains(&ContinuousModification::AddPower { value: 1 }));
+        assert!(def
+            .modifications
+            .contains(&ContinuousModification::AddToughness { value: 1 }));
+        assert!(def
+            .modifications
+            .contains(&ContinuousModification::AddKeyword {
+                keyword: Keyword::Flying,
+            }));
+        assert!(def
+            .modifications
+            .contains(&ContinuousModification::AddKeyword {
+                keyword: Keyword::Vigilance,
+            }));
+        assert!(def
+            .modifications
+            .contains(&ContinuousModification::AddKeyword {
+                keyword: Keyword::Lifelink,
+            }));
+    }
+
+    #[test]
     fn static_self_gets_pt() {
         let def = parse_static_line("Tarmogoyf gets +1/+2.").unwrap();
         assert_eq!(def.mode, StaticMode::Continuous);
@@ -12246,6 +12314,43 @@ mod tests {
                     keyword: Keyword::Hexproof,
                 }),
             "Expected AddKeyword(Hexproof), got {:?}",
+            def.modifications
+        );
+        assert_eq!(def.condition, None);
+    }
+
+    #[test]
+    fn static_as_long_as_enchanted_creature_is_legendary_grants_to_enchanted_creature() {
+        let def = parse_static_line(
+            "As long as enchanted creature is legendary, it gets +1/+1 and has ward {1}.",
+        )
+        .expect("should parse enchanted-subject inverted grant");
+        assert_eq!(def.mode, StaticMode::Continuous);
+        assert_eq!(
+            def.affected,
+            Some(TargetFilter::Typed(TypedFilter::creature().properties(
+                vec![
+                    FilterProp::EnchantedBy,
+                    FilterProp::HasSupertype {
+                        value: Supertype::Legendary,
+                    },
+                ]
+            )))
+        );
+        assert!(def
+            .modifications
+            .contains(&ContinuousModification::AddPower { value: 1 }));
+        assert!(def
+            .modifications
+            .contains(&ContinuousModification::AddToughness { value: 1 }));
+        assert!(
+            def.modifications.iter().any(|modification| matches!(
+                modification,
+                ContinuousModification::AddKeyword {
+                    keyword: Keyword::Ward { .. },
+                }
+            )),
+            "Expected AddKeyword(Ward), got {:?}",
             def.modifications
         );
         assert_eq!(def.condition, None);
