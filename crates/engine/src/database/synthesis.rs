@@ -134,6 +134,20 @@ impl KeywordTriggerInstaller {
         }
     }
 
+    pub fn trigger_matches_keyword_kind(trigger: &TriggerDefinition, keyword: &Keyword) -> bool {
+        match keyword {
+            Keyword::Echo(_) => is_echo_trigger(trigger),
+            Keyword::Undying => {
+                is_dies_return_with_counter_trigger(trigger, &CounterType::Plus1Plus1)
+            }
+            Keyword::Persist => {
+                is_dies_return_with_counter_trigger(trigger, &CounterType::Minus1Minus1)
+            }
+            Keyword::Annihilator(_) => is_annihilator_attack_trigger(trigger),
+            _ => false,
+        }
+    }
+
     fn install_matching<F>(face: &mut CardFace, matches_keyword: F)
     where
         F: Fn(&Keyword) -> bool,
@@ -757,7 +771,7 @@ pub fn synthesize_level_up(face: &mut CardFace) {
                     AbilityDefinition::new(
                         AbilityKind::Activated,
                         Effect::PutCounter {
-                            counter_type: "level".to_string(),
+                            counter_type: CounterType::Generic("level".to_string()),
                             count: QuantityExpr::Fixed { value: 1 },
                             target: TargetFilter::SelfRef,
                         },
@@ -947,7 +961,7 @@ pub fn synthesize_scavenge(face: &mut CardFace) {
             // target creature." SelfPower is resolved via LKI at resolution time so the
             // power read is the card's last known power before it was exiled.
             let effect = Effect::PutCounter {
-                counter_type: "P1P1".to_string(),
+                counter_type: CounterType::Plus1Plus1,
                 count: QuantityExpr::Ref {
                     qty: QuantityRef::Power {
                         scope: crate::types::ability::ObjectScope::Source,
@@ -1374,7 +1388,7 @@ pub fn synthesize_fabricate(face: &mut CardFace) {
         let counters_branch = AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::PutCounter {
-                counter_type: "P1P1".to_string(),
+                counter_type: CounterType::Plus1Plus1,
                 count: count_expr.clone(),
                 target: TargetFilter::SelfRef,
             },
@@ -1515,7 +1529,6 @@ pub fn synthesize_annihilator(face: &mut CardFace) {
 /// The check is narrow on purpose: an unrelated `Attacks` trigger on the same
 /// face (e.g., "Whenever ~ attacks, you draw a card") must NOT be counted as
 /// an existing Annihilator emission.
-#[cfg(test)]
 fn is_annihilator_attack_trigger(t: &TriggerDefinition) -> bool {
     if !matches!(t.mode, TriggerMode::Attacks)
         || !matches!(t.valid_card, Some(TargetFilter::SelfRef))
@@ -1533,6 +1546,21 @@ fn is_annihilator_attack_trigger(t: &TriggerDefinition) -> bool {
         TargetFilter::Typed(tf)
             if tf.controller == Some(ControllerRef::DefendingPlayer)
     )
+}
+
+fn is_echo_trigger(t: &TriggerDefinition) -> bool {
+    matches!(t.mode, TriggerMode::PayEcho)
+        && t.phase == Some(Phase::Upkeep)
+        && matches!(t.valid_target, Some(TargetFilter::Controller))
+        && matches!(t.condition, Some(TriggerCondition::EchoDue))
+        && t.unless_pay.is_some()
+        && matches!(
+            t.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                ..
+            })
+        )
 }
 
 fn build_echo_trigger(cost: ManaCost) -> TriggerDefinition {
@@ -1602,6 +1630,7 @@ fn build_dies_return_with_counter_trigger(
     counter_label: &str,
     cr_ref: &str,
 ) -> TriggerDefinition {
+    let counter_type = crate::types::counter::parse_counter_type(counter_type);
     // CR 122.1 + CR 614.1c: Single +1/+1 (or -1/-1) counter applied as
     // the object enters the battlefield, via the existing
     // `Effect::ChangeZone.enter_with_counters` plumbing.
@@ -1618,7 +1647,7 @@ fn build_dies_return_with_counter_trigger(
         enter_tapped: false,
         enters_attacking: false,
         up_to: false,
-        enter_with_counters: vec![(counter_type.to_string(), QuantityExpr::Fixed { value: 1 })],
+        enter_with_counters: vec![(counter_type.clone(), QuantityExpr::Fixed { value: 1 })],
     };
 
     let execute = AbilityDefinition::new(AbilityKind::Spell, return_effect).description(format!(
@@ -1630,7 +1659,7 @@ fn build_dies_return_with_counter_trigger(
     // type in the LKI snapshot captured by `apply_zone_exit_cleanup`.
     let condition = TriggerCondition::Not {
         condition: Box::new(TriggerCondition::HadCounters {
-            counter_type: Some(counter_type.to_string()),
+            counter_type: Some(counter_type),
         }),
     };
 
@@ -1652,8 +1681,7 @@ fn build_dies_return_with_counter_trigger(
 /// the counter type on the execute body's `enter_with_counters`) — so an
 /// unrelated dies-trigger on the same face (e.g., "When ~ dies, draw a card")
 /// is correctly ignored.
-#[cfg(test)]
-fn is_dies_return_with_counter_trigger(t: &TriggerDefinition, counter_type: &str) -> bool {
+fn is_dies_return_with_counter_trigger(t: &TriggerDefinition, counter_type: &CounterType) -> bool {
     if !matches!(t.mode, TriggerMode::ChangesZone)
         || t.origin != Some(Zone::Battlefield)
         || t.destination != Some(Zone::Graveyard)
@@ -1764,7 +1792,7 @@ pub fn synthesize_modular(face: &mut CardFace) {
         let etb_counters = AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::PutCounter {
-                counter_type: "P1P1".to_string(),
+                counter_type: CounterType::Plus1Plus1,
                 count: QuantityExpr::Fixed { value: n as i32 },
                 target: TargetFilter::SelfRef,
             },
@@ -1797,11 +1825,11 @@ pub fn synthesize_modular(face: &mut CardFace) {
         let transfer = AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::PutCounter {
-                counter_type: "P1P1".to_string(),
+                counter_type: CounterType::Plus1Plus1,
                 count: QuantityExpr::Ref {
                     qty: QuantityRef::CountersOn {
                         scope: ObjectScope::Source,
-                        counter_type: Some("P1P1".to_string()),
+                        counter_type: Some(CounterType::Plus1Plus1),
                     },
                 },
                 // CR 702.43a: "target artifact creature" — conjunction of
@@ -1855,7 +1883,7 @@ fn is_modular_etb_replacement(replacement: &ReplacementDefinition, expected_n: u
             counter_type,
             count: QuantityExpr::Fixed { value },
             target: TargetFilter::SelfRef,
-        } if counter_type == "P1P1" && *value == expected_n as i32
+        } if *counter_type == CounterType::Plus1Plus1 && *value == expected_n as i32
     )
 }
 
@@ -1885,8 +1913,8 @@ fn is_modular_dies_transfer_trigger(t: &TriggerDefinition) -> bool {
                 },
             },
             target: TargetFilter::Typed(tf),
-        } if counter_type == "P1P1"
-            && lki_ct == "P1P1"
+        } if *counter_type == CounterType::Plus1Plus1
+            && *lki_ct == CounterType::Plus1Plus1
             && tf.type_filters.iter().any(|f| matches!(f, TypeFilter::Creature))
             && tf.type_filters.iter().any(|f| matches!(f, TypeFilter::Artifact))
     )
@@ -1945,7 +1973,7 @@ pub fn synthesize_bloodthirst(face: &mut CardFace) {
         let etb_counters = AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::PutCounter {
-                counter_type: "P1P1".to_string(),
+                counter_type: CounterType::Plus1Plus1,
                 count: QuantityExpr::Fixed { value: n as i32 },
                 target: TargetFilter::SelfRef,
             },
@@ -2003,7 +2031,7 @@ fn is_bloodthirst_etb_replacement(replacement: &ReplacementDefinition, expected_
             counter_type,
             count: QuantityExpr::Fixed { value },
             target: TargetFilter::SelfRef,
-        } if counter_type == "P1P1" && *value == expected_n as i32
+        } if *counter_type == CounterType::Plus1Plus1 && *value == expected_n as i32
     )
 }
 
@@ -2065,7 +2093,7 @@ pub fn synthesize_suspend(face: &mut CardFace) {
             && matches!(
                 &*a.effect,
                 Effect::PutCounter { counter_type, target: TargetFilter::SelfRef, .. }
-                    if counter_type == "time"
+                    if *counter_type == CounterType::Time
             )
     });
     if !already_has_activation {
@@ -2088,7 +2116,7 @@ pub fn synthesize_suspend(face: &mut CardFace) {
             // typed CounterType variant; the legacy String API for PutCounter
             // takes the canonical `as_str()` value ("time").
             Effect::PutCounter {
-                counter_type: CounterType::Time.as_str().to_string(),
+                counter_type: CounterType::Time,
                 count: QuantityExpr::Fixed {
                     value: time_counters as i32,
                 },
@@ -2114,15 +2142,15 @@ pub fn synthesize_suspend(face: &mut CardFace) {
             && matches!(t.valid_card, Some(TargetFilter::SelfRef))
             && matches!(
                 t.execute.as_deref().map(|a| &*a.effect),
-                Some(Effect::RemoveCounter { counter_type, target: TargetFilter::SelfRef, .. })
-                    if counter_type == "time"
+                Some(Effect::RemoveCounter { counter_type: Some(counter_type), target: TargetFilter::SelfRef, .. })
+                    if *counter_type == CounterType::Time
             )
     });
     if !already_has_upkeep_trigger {
         let remove_one = AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::RemoveCounter {
-                counter_type: CounterType::Time.as_str().to_string(),
+                counter_type: Some(CounterType::Time),
                 count: 1,
                 target: TargetFilter::SelfRef,
             },
@@ -3358,7 +3386,7 @@ mod fabricate_synthesis_tests {
         else {
             unreachable!();
         };
-        assert_eq!(counter_type, "P1P1");
+        assert_eq!(counter_type, &CounterType::Plus1Plus1);
         assert!(matches!(count, QuantityExpr::Fixed { value: 2 }));
         assert!(matches!(target, TargetFilter::SelfRef));
 
@@ -3529,54 +3557,89 @@ mod fabricate_runtime_tests {
         }
     }
 
-    /// Place a fabricate-bearing creature on the battlefield, fire the ETB
-    /// event, and resolve the stack down to the choose-one-of branch prompt.
-    fn etb_and_resolve_to_choice(face: &CardFace, controller: PlayerId) -> (GameState, ObjectId) {
+    fn setup_state_with_priority(controller: PlayerId) -> GameState {
         let mut state = GameState::new_two_player(42);
         state.turn_number = 2;
         state.phase = crate::types::phase::Phase::PreCombatMain;
         state.active_player = controller;
         state.priority_player = controller;
         state.waiting_for = WaitingFor::Priority { player: controller };
+        state
+    }
 
+    /// Cast a Fabricate creature from hand, then pass priority through the
+    /// normal stack pipeline until the ETB trigger resolves into the
+    /// ChooseOneOfBranch prompt. This intentionally does not synthesize the
+    /// ZoneChanged event or call process_triggers directly.
+    fn cast_and_resolve_fabricate_to_choice(
+        face: &CardFace,
+        controller: PlayerId,
+    ) -> (GameState, ObjectId) {
+        let mut state = setup_state_with_priority(controller);
         let next_card = CardId(state.next_object_id);
         let obj_id = create_object(
             &mut state,
             next_card,
             controller,
             face.name.clone(),
-            Zone::Battlefield,
+            Zone::Hand,
         );
         {
             let obj = state.objects.get_mut(&obj_id).unwrap();
             apply_card_face_to_object(obj, face);
         }
 
-        // Fabricate's ETB trigger goes onto the stack via process_triggers.
-        process_triggers(&mut state, &[etb_event(obj_id, &face.name)]);
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::CastSpell {
+                object_id: obj_id,
+                card_id: next_card,
+                targets: vec![],
+            },
+        )
+        .unwrap();
 
-        // Stack should have the synthesized triggered ability.
-        assert!(
-            state
+        let mut saw_fabricate_trigger_on_stack = false;
+        for _ in 0..8 {
+            if matches!(state.waiting_for, WaitingFor::ChooseOneOfBranch { .. }) {
+                assert!(
+                    saw_fabricate_trigger_on_stack,
+                    "Fabricate ETB trigger must land on the stack before resolving"
+                );
+                assert_eq!(
+                    state.objects.get(&obj_id).unwrap().zone,
+                    Zone::Battlefield,
+                    "Fabricate creature must enter through stack resolution"
+                );
+                return (state, obj_id);
+            }
+
+            assert!(
+                matches!(state.waiting_for, WaitingFor::Priority { .. }),
+                "expected priority while advancing cast/trigger pipeline, got {:?}",
+                state.waiting_for
+            );
+            saw_fabricate_trigger_on_stack |= state
                 .stack
                 .iter()
-                .any(|entry| matches!(&entry.kind, StackEntryKind::TriggeredAbility { .. })),
-            "Fabricate ETB trigger must land on the stack"
-        );
+                .any(|entry| matches!(&entry.kind, StackEntryKind::TriggeredAbility { .. }));
+            crate::game::engine::apply_as_current(&mut state, GameAction::PassPriority).unwrap();
+        }
 
-        // Drain the stack: resolve top should consume the trigger and
-        // hand off to ChooseOneOfBranch.
-        let mut events = Vec::new();
-        crate::game::stack::resolve_top(&mut state, &mut events);
-        (state, obj_id)
+        panic!(
+            "Fabricate ETB trigger did not resolve to ChooseOneOfBranch; waiting_for={:?}, stack_len={}",
+            state.waiting_for,
+            state.stack.len()
+        );
     }
 
     /// CR 702.123a branch A: choosing the +1/+1 counter branch places N
-    /// P1P1 counters on the entering permanent.
+    /// P1P1 counters on the permanent that entered via normal spell
+    /// resolution.
     #[test]
-    fn fabricate_counter_branch_places_p1p1_counters_on_self() {
+    fn fabricate_e2e_counter_branch_places_p1p1_counters_on_self() {
         let face = fabricate_creature_face("Cultivator of Blades", 2);
-        let (mut state, obj_id) = etb_and_resolve_to_choice(&face, PlayerId(0));
+        let (mut state, obj_id) = cast_and_resolve_fabricate_to_choice(&face, PlayerId(0));
 
         // Confirm the choose-one-of prompt is waiting on the controller.
         assert!(matches!(
@@ -3605,11 +3668,12 @@ mod fabricate_runtime_tests {
     }
 
     /// CR 702.123a branch B: choosing the Servo branch creates N 1/1
-    /// colorless Servo artifact creature tokens under the controller.
+    /// colorless Servo artifact creature tokens under the controller after
+    /// normal spell and ETB-trigger resolution.
     #[test]
-    fn fabricate_servo_branch_creates_artifact_creature_tokens() {
+    fn fabricate_e2e_servo_branch_creates_artifact_creature_tokens() {
         let face = fabricate_creature_face("Cultivator of Blades", 2);
-        let (mut state, _obj_id) = etb_and_resolve_to_choice(&face, PlayerId(0));
+        let (mut state, _obj_id) = cast_and_resolve_fabricate_to_choice(&face, PlayerId(0));
 
         // Branch 1 = Servo tokens.
         crate::game::engine::apply_as_current(&mut state, GameAction::ChooseBranch { index: 1 })
@@ -3649,7 +3713,7 @@ mod fabricate_runtime_tests {
     #[test]
     fn fabricate_one_resolves_with_singleton_payload() {
         let face = fabricate_creature_face("Ambitious Aetherborn", 1);
-        let (mut state, obj_id) = etb_and_resolve_to_choice(&face, PlayerId(0));
+        let (mut state, obj_id) = cast_and_resolve_fabricate_to_choice(&face, PlayerId(0));
 
         crate::game::engine::apply_as_current(&mut state, GameAction::ChooseBranch { index: 0 })
             .unwrap();
@@ -3664,8 +3728,9 @@ mod fabricate_runtime_tests {
         assert_eq!(p1p1_count, 1);
     }
 
-    /// Negative: a non-Fabricate creature ETB must not synthesize a
-    /// ChooseOneOf prompt. Guards against the synthesizer over-firing.
+    /// Lower-level trigger plumbing negative: a non-Fabricate creature ETB
+    /// event must not synthesize a ChooseOneOf prompt. The positive branch
+    /// tests above cover the full cast/priority/stack runtime pipeline.
     #[test]
     fn etb_without_fabricate_does_not_emit_choose_one_of() {
         let mut face = CardFace {
@@ -3677,14 +3742,7 @@ mod fabricate_runtime_tests {
         face.card_type.core_types.push(CoreType::Creature);
         synthesize_all(&mut face);
 
-        let mut state = GameState::new_two_player(42);
-        state.turn_number = 2;
-        state.phase = crate::types::phase::Phase::PreCombatMain;
-        state.active_player = PlayerId(0);
-        state.priority_player = PlayerId(0);
-        state.waiting_for = WaitingFor::Priority {
-            player: PlayerId(0),
-        };
+        let mut state = setup_state_with_priority(PlayerId(0));
 
         let next_card = CardId(state.next_object_id);
         let obj_id = create_object(
@@ -3737,7 +3795,7 @@ mod undying_persist_synthesis_tests {
         let trigger = face
             .triggers
             .iter()
-            .find(|t| is_dies_return_with_counter_trigger(t, "P1P1"))
+            .find(|t| is_dies_return_with_counter_trigger(t, &CounterType::Plus1Plus1))
             .expect("undying should synthesize a dies-return trigger");
 
         // Trigger shape: dies (battlefield → graveyard) with self-ref filter.
@@ -3753,7 +3811,7 @@ mod undying_persist_synthesis_tests {
         let TriggerCondition::HadCounters { counter_type } = condition.as_ref() else {
             panic!("undying inner condition should be HadCounters");
         };
-        assert_eq!(counter_type.as_deref(), Some("P1P1"));
+        assert_eq!(counter_type, &Some(CounterType::Plus1Plus1));
 
         // Execute: ChangeZone graveyard → battlefield + one P1P1 counter.
         let execute = trigger.execute.as_deref().expect("execute body required");
@@ -3776,7 +3834,7 @@ mod undying_persist_synthesis_tests {
         assert!(!*under_your_control);
         assert_eq!(enter_with_counters.len(), 1);
         let (ct, qty) = &enter_with_counters[0];
-        assert_eq!(ct, "P1P1");
+        assert_eq!(ct, &CounterType::Plus1Plus1);
         assert!(matches!(qty, QuantityExpr::Fixed { value: 1 }));
     }
 
@@ -3790,7 +3848,7 @@ mod undying_persist_synthesis_tests {
         let trigger = face
             .triggers
             .iter()
-            .find(|t| is_dies_return_with_counter_trigger(t, "M1M1"))
+            .find(|t| is_dies_return_with_counter_trigger(t, &CounterType::Minus1Minus1))
             .expect("persist should synthesize a dies-return trigger");
 
         let Some(TriggerCondition::Not { condition }) = &trigger.condition else {
@@ -3799,7 +3857,7 @@ mod undying_persist_synthesis_tests {
         let TriggerCondition::HadCounters { counter_type } = condition.as_ref() else {
             panic!("persist inner condition should be HadCounters");
         };
-        assert_eq!(counter_type.as_deref(), Some("M1M1"));
+        assert_eq!(counter_type, &Some(CounterType::Minus1Minus1));
 
         let execute = trigger.execute.as_deref().expect("execute body required");
         let Effect::ChangeZone {
@@ -3810,7 +3868,7 @@ mod undying_persist_synthesis_tests {
             panic!("persist execute should be Effect::ChangeZone");
         };
         let (ct, qty) = &enter_with_counters[0];
-        assert_eq!(ct, "M1M1");
+        assert_eq!(ct, &CounterType::Minus1Minus1);
         assert!(matches!(qty, QuantityExpr::Fixed { value: 1 }));
     }
 
@@ -3825,7 +3883,7 @@ mod undying_persist_synthesis_tests {
         let count = face
             .triggers
             .iter()
-            .filter(|t| is_dies_return_with_counter_trigger(t, "P1P1"))
+            .filter(|t| is_dies_return_with_counter_trigger(t, &CounterType::Plus1Plus1))
             .count();
         assert_eq!(count, 1, "undying trigger should be deduped");
     }
@@ -3838,7 +3896,7 @@ mod undying_persist_synthesis_tests {
         let count = face
             .triggers
             .iter()
-            .filter(|t| is_dies_return_with_counter_trigger(t, "M1M1"))
+            .filter(|t| is_dies_return_with_counter_trigger(t, &CounterType::Minus1Minus1))
             .count();
         assert_eq!(count, 1, "persist trigger should be deduped");
     }
@@ -3871,7 +3929,7 @@ mod undying_persist_synthesis_tests {
         let count = face
             .triggers
             .iter()
-            .filter(|t| is_dies_return_with_counter_trigger(t, "P1P1"))
+            .filter(|t| is_dies_return_with_counter_trigger(t, &CounterType::Plus1Plus1))
             .count();
         assert_eq!(count, 2);
     }
@@ -3891,12 +3949,12 @@ mod undying_persist_synthesis_tests {
         let p1p1 = face
             .triggers
             .iter()
-            .filter(|t| is_dies_return_with_counter_trigger(t, "P1P1"))
+            .filter(|t| is_dies_return_with_counter_trigger(t, &CounterType::Plus1Plus1))
             .count();
         let m1m1 = face
             .triggers
             .iter()
-            .filter(|t| is_dies_return_with_counter_trigger(t, "M1M1"))
+            .filter(|t| is_dies_return_with_counter_trigger(t, &CounterType::Minus1Minus1))
             .count();
         assert_eq!(p1p1, 1, "exactly one Undying trigger");
         assert_eq!(m1m1, 1, "exactly one Persist trigger");
@@ -4987,7 +5045,7 @@ mod scavenge_synthesis_tests {
                 count,
                 target,
             } => {
-                assert_eq!(counter_type, "P1P1");
+                assert_eq!(counter_type, &CounterType::Plus1Plus1);
                 assert!(matches!(
                     count,
                     QuantityExpr::Ref {
@@ -5694,7 +5752,7 @@ mod suspend_synthesis_tests {
                 count,
                 target,
             } => {
-                assert_eq!(counter_type, "time");
+                assert_eq!(counter_type, &CounterType::Time);
                 assert!(matches!(target, TargetFilter::SelfRef));
                 assert!(matches!(count, QuantityExpr::Fixed { value: 3 }));
             }
@@ -5724,7 +5782,7 @@ mod suspend_synthesis_tests {
                 counter_type,
                 target: TargetFilter::SelfRef,
                 ..
-            }) => assert_eq!(counter_type, "time"),
+            }) => assert_eq!(counter_type, &Some(CounterType::Time)),
             other => panic!("expected RemoveCounter effect, got {other:?}"),
         }
 
@@ -6463,7 +6521,7 @@ mod modular_synthesis_tests {
         else {
             panic!("modular ETB execute body should be Effect::PutCounter");
         };
-        assert_eq!(counter_type, "P1P1");
+        assert_eq!(counter_type, &CounterType::Plus1Plus1);
         assert!(matches!(target, TargetFilter::SelfRef));
         assert!(matches!(count, QuantityExpr::Fixed { value: 2 }));
     }
@@ -6507,7 +6565,7 @@ mod modular_synthesis_tests {
         else {
             panic!("modular dies execute body should be Effect::PutCounter");
         };
-        assert_eq!(counter_type, "P1P1");
+        assert_eq!(counter_type, &CounterType::Plus1Plus1);
 
         // Count = LKI P1P1 counter count on the dying source.
         let QuantityExpr::Ref { qty } = count else {
@@ -6521,7 +6579,7 @@ mod modular_synthesis_tests {
             panic!("modular dies count should be QuantityRef::CountersOn");
         };
         assert!(matches!(scope, ObjectScope::Source));
-        assert_eq!(lki_ct.as_deref(), Some("P1P1"));
+        assert_eq!(lki_ct, &Some(CounterType::Plus1Plus1));
 
         // Target = artifact creature (conjunction).
         let TargetFilter::Typed(tf) = target else {
@@ -6695,7 +6753,7 @@ mod modular_synthesis_tests {
             execute: Some(Box::new(AbilityDefinition::new(
                 AbilityKind::Spell,
                 Effect::PutCounter {
-                    counter_type: "P1P1".to_string(),
+                    counter_type: CounterType::Plus1Plus1,
                     count: QuantityExpr::Fixed { value: 3 },
                     target: TargetFilter::SelfRef,
                 },
@@ -6846,13 +6904,12 @@ mod modular_runtime_tests {
             .get(&object_id)
             .map(|obj| obj.controller)
             .unwrap_or(controller);
-        for (counter_type_str, count) in &enter_with_counters {
-            let ct = crate::types::counter::parse_counter_type(counter_type_str);
+        for (counter_type, count) in &enter_with_counters {
             crate::game::effects::counters::add_counter_with_replacement(
                 state,
                 actor,
                 object_id,
-                ct,
+                counter_type.clone(),
                 *count,
                 &mut events,
             );
@@ -7438,7 +7495,7 @@ mod bloodthirst_synthesis_tests {
         else {
             panic!("bloodthirst ETB execute body should be Effect::PutCounter");
         };
-        assert_eq!(counter_type, "P1P1");
+        assert_eq!(counter_type, &CounterType::Plus1Plus1);
         assert!(matches!(target, TargetFilter::SelfRef));
         assert!(matches!(count, QuantityExpr::Fixed { value: 2 }));
     }
@@ -7525,7 +7582,7 @@ mod bloodthirst_synthesis_tests {
             execute: Some(Box::new(AbilityDefinition::new(
                 AbilityKind::Spell,
                 Effect::PutCounter {
-                    counter_type: "P1P1".to_string(),
+                    counter_type: CounterType::Plus1Plus1,
                     count: QuantityExpr::Fixed { value: 3 },
                     target: TargetFilter::SelfRef,
                 },
@@ -7558,7 +7615,7 @@ mod bloodthirst_synthesis_tests {
             execute: Some(Box::new(AbilityDefinition::new(
                 AbilityKind::Spell,
                 Effect::PutCounter {
-                    counter_type: "P1P1".to_string(),
+                    counter_type: CounterType::Plus1Plus1,
                     count: QuantityExpr::Fixed { value: 2 },
                     target: TargetFilter::SelfRef,
                 },
@@ -7681,13 +7738,12 @@ mod bloodthirst_runtime_tests {
             .get(&object_id)
             .map(|obj| obj.controller)
             .unwrap_or(controller);
-        for (counter_type_str, count) in &enter_with_counters {
-            let ct = crate::types::counter::parse_counter_type(counter_type_str);
+        for (counter_type, count) in &enter_with_counters {
             crate::game::effects::counters::add_counter_with_replacement(
                 state,
                 actor,
                 object_id,
-                ct,
+                counter_type.clone(),
                 *count,
                 &mut events,
             );
