@@ -576,10 +576,19 @@ mod tests {
             up_to: false,
             destination: Zone::Hand,
         };
+        state
+            .outside_game_cards_brought_in
+            .push(OutsideGameCardUse {
+                player: PlayerId(0),
+                sideboard_index: 0,
+                count: 1,
+            });
 
         let self_view = crate::game::filter_state_for_viewer(&state, PlayerId(0));
         let opponent_view = crate::game::filter_state_for_viewer(&state, PlayerId(1));
 
+        assert_eq!(self_view.outside_game_cards_brought_in.len(), 1);
+        assert!(opponent_view.outside_game_cards_brought_in.is_empty());
         match self_view.waiting_for {
             WaitingFor::OutsideGameChoice { choices, count, .. } => {
                 assert_eq!(count, 1);

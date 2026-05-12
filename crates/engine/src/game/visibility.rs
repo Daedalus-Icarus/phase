@@ -363,6 +363,9 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
     filtered
         .cards_drawn_this_turn
         .retain(|pid, _| can_view_private_for_player(*pid));
+    filtered
+        .outside_game_cards_brought_in
+        .retain(|record| record.player == viewer);
 
     // CR 601.2 + CR 408: A spell being cast is on the stack and is public information —
     // caster, targets, chosen X values, and pending mana payment are all visible to

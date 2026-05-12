@@ -840,22 +840,31 @@ function SearchModal({ data }: { data: SearchChoice["data"] }) {
 
 function OutsideGameModal({ data }: { data: OutsideGameChoice["data"] }) {
   const dispatch = useGameDispatch();
-  const [selectedSet, setSelectedSet] = useState<Set<number>>(new Set());
+  const [selectedCounts, setSelectedCounts] = useState<Map<number, number>>(new Map());
+  const selectedIndices = useMemo(
+    () =>
+      Array.from(selectedCounts.entries()).flatMap(([sideboardIndex, count]) =>
+        Array.from({ length: count }, () => sideboardIndex),
+      ),
+    [selectedCounts],
+  );
   const minCount = data.up_to ? 0 : data.count;
-  const countValid = selectedSet.size >= minCount && selectedSet.size <= data.count;
+  const countValid = selectedIndices.length >= minCount && selectedIndices.length <= data.count;
 
   useEffect(() => {
-    setSelectedSet(new Set());
+    setSelectedCounts(new Map());
   }, [data]);
 
   const toggleSelect = useCallback(
-    (sideboardIndex: number) => {
-      setSelectedSet((prev) => {
-        const next = new Set(prev);
-        if (next.has(sideboardIndex)) {
+    (sideboardIndex: number, maxCopies: number) => {
+      setSelectedCounts((prev) => {
+        const next = new Map(prev);
+        const current = next.get(sideboardIndex) ?? 0;
+        const selectedTotal = Array.from(prev.values()).reduce((sum, count) => sum + count, 0);
+        if (current > 0 && (current >= maxCopies || selectedTotal >= data.count)) {
           next.delete(sideboardIndex);
-        } else if (next.size < data.count) {
-          next.add(sideboardIndex);
+        } else if (selectedTotal < data.count) {
+          next.set(sideboardIndex, current + 1);
         }
         return next;
       });
@@ -867,10 +876,10 @@ function OutsideGameModal({ data }: { data: OutsideGameChoice["data"] }) {
     if (countValid) {
       dispatch({
         type: "ChooseOutsideGameCards",
-        data: { sideboard_indices: Array.from(selectedSet) },
+        data: { sideboard_indices: selectedIndices },
       });
     }
-  }, [countValid, dispatch, selectedSet]);
+  }, [countValid, dispatch, selectedIndices]);
 
   return (
     <ChoiceOverlay
@@ -880,7 +889,8 @@ function OutsideGameModal({ data }: { data: OutsideGameChoice["data"] }) {
     >
       <div className="flex max-h-[60vh] min-w-[280px] flex-col gap-2 overflow-y-auto p-1">
         {data.choices.map((choice) => {
-          const isSelected = selectedSet.has(choice.sideboard_index);
+          const selectedCount = selectedCounts.get(choice.sideboard_index) ?? 0;
+          const isSelected = selectedCount > 0;
           return (
             <button
               key={choice.sideboard_index}
@@ -890,10 +900,12 @@ function OutsideGameModal({ data }: { data: OutsideGameChoice["data"] }) {
                   ? "border-emerald-400 bg-emerald-500/20 text-white"
                   : "border-white/15 bg-black/30 text-zinc-100 hover:bg-white/10"
               }`}
-              onClick={() => toggleSelect(choice.sideboard_index)}
+              onClick={() => toggleSelect(choice.sideboard_index, choice.entry.count)}
             >
               <span>{choice.entry.card.name}</span>
-              <span className="text-xs text-zinc-400">x{choice.entry.count}</span>
+              <span className="text-xs text-zinc-400">
+                {isSelected ? `${selectedCount}/` : ""}x{choice.entry.count}
+              </span>
             </button>
           );
         })}
