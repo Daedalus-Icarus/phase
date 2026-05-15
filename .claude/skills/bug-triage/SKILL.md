@@ -9,6 +9,15 @@ bun scripts/sync-bug-reports.ts extract
 bun scripts/sync-bug-reports.ts triage
 bun scripts/sync-bug-reports.ts render
 
+# Publish: create GH issues for `create_issue` triage items AND react 👀 +
+# post a tracking link inside the originating Discord thread. Also reconciles
+# threads whose triage item is already linked to an open issue (write-back
+# only — no duplicate creation). Once-per-thread; mapping persisted in
+# triage/sync-state.json under `published_threads`.
+bun scripts/sync-bug-reports.ts publish --dry-run        # preview without side effects
+bun scripts/sync-bug-reports.ts publish --limit=5        # cap thread count per run
+bun scripts/sync-bug-reports.ts publish                  # full run
+
 # Check a specific card's parser status
 jq '.["card name"]' client/public/card-data.json
 jq '.["card name"] | {abilities: [.abilities[]? | select(.effect.type == "Unimplemented")], triggers: [.triggers[]? | select(.mode == "Unknown")]}' client/public/card-data.json

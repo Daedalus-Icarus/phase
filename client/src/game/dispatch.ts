@@ -95,12 +95,17 @@ async function processAction(action: GameAction, actor: number): Promise<void> {
   const snapshot = useAnimationStore.getState().captureSnapshot();
   currentSnapshot = snapshot;
 
-  // 2. Save undo history if applicable. Gated off in multiplayer because
-  // rewinding a single client's view desyncs from the authoritative game
-  // state on the wire.
+  // 2. Save undo history if applicable. Three conditions must hold:
+  //    a) Action is unrevealed-information (UNDOABLE_ACTIONS).
+  //    b) Single-player — rewinding one client desyncs multiplayer.
+  //    c) Stack is currently empty. Checkpoints exist only at stack-empty
+  //       boundaries so undo always lands before the activation/trigger
+  //       sequence that put things on the stack, never mid-resolution.
   const { gameMode } = useGameStore.getState();
   const shouldSaveHistory =
-    UNDOABLE_ACTIONS.has(action.type) && !isMultiplayerMode(gameMode);
+    UNDOABLE_ACTIONS.has(action.type) &&
+    !isMultiplayerMode(gameMode) &&
+    gameState.stack.length === 0;
 
   // 3. Call WASM — get events without updating state yet.
   // `actor` is the authenticated seat ID of whoever initiated this dispatch
