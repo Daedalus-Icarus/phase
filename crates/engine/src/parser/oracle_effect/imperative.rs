@@ -1536,6 +1536,10 @@ pub(super) fn parse_search_and_creation_ast(
     if let Some((_, _)) = nom_on_lower(text, lower, |input| value((), tag("create ")).parse(input))
     {
         return match try_parse_token(lower, text, ctx) {
+            // `owner` is absorbed by `..`: this search/creation path always
+            // yields the `TargetFilter::Controller` default, and the lowering
+            // below re-emits it. A "target [player] creates" subject is lifted
+            // by `inject_subject_target` after lowering.
             Some(Effect::CopyTokenOf {
                 target,
                 source_filter,
@@ -1544,6 +1548,7 @@ pub(super) fn parse_search_and_creation_ast(
                 count,
                 extra_keywords,
                 additional_modifications,
+                ..
             }) => Some(SearchCreationImperativeAst::CopyTokenOf {
                 target,
                 count,
@@ -1685,6 +1690,7 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
             additional_modifications,
         } => Effect::CopyTokenOf {
             target,
+            owner: TargetFilter::Controller,
             source_filter,
             enters_attacking,
             tapped,

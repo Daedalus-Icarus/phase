@@ -3358,6 +3358,83 @@ mod tests {
         assert_eq!(counter_step.targets, vec![TargetRef::Object(artifact)]);
     }
 
+    /// CR 109.4 + CR 707.2: "target opponent creates a token that's a copy of
+    /// it" — Wedding Ring's shape. `CopyTokenOf` with a context-ref copy source
+    /// (`ParentTarget`) and a `Typed{Opponent}` owner must surface exactly one
+    /// player target slot, scoped to the opponent (issue #403 defect 1).
+    #[test]
+    fn build_target_slots_copy_token_owner_target_opponent_is_opponent_only() {
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::ParentTarget,
+                owner: TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::Opponent),
+                ),
+                source_filter: None,
+                enters_attacking: false,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        let state = GameState::new_two_player(42);
+
+        let slots = build_target_slots(&state, &ability).expect("target slots should build");
+        assert_eq!(
+            slots.len(),
+            1,
+            "the `owner` axis must surface one player target slot"
+        );
+        assert_eq!(slots[0].legal_targets, vec![TargetRef::Player(PlayerId(1))]);
+    }
+
+    /// Regression guard: "create a token that's a copy of target creature" —
+    /// the copy *source* is the targeted axis, so the slot is the creature
+    /// filter, not the (default) `owner`.
+    #[test]
+    fn build_target_slots_copy_token_targeted_source_surfaces_creature_slot() {
+        let creature = {
+            let mut s = GameState::new_two_player(42);
+            let id = create_object(
+                &mut s,
+                CardId(9),
+                PlayerId(1),
+                "Grizzly Bears".to_string(),
+                Zone::Battlefield,
+            );
+            s.objects.get_mut(&id).unwrap().card_types.core_types = vec![CoreType::Creature];
+            (s, id)
+        };
+        let (state, creature_id) = creature;
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        let slots = build_target_slots(&state, &ability).expect("target slots should build");
+        assert_eq!(slots.len(), 1, "the copy-source axis surfaces one slot");
+        assert!(
+            slots[0]
+                .legal_targets
+                .contains(&TargetRef::Object(creature_id)),
+            "the slot must enumerate creature copy-source candidates"
+        );
+    }
+
     #[test]
     fn build_target_slots_token_owner_target_opponent_is_opponent_only() {
         // CR 111.2 + CR 115.1: Forbidden Orchard-shape effects encode

@@ -4,6 +4,7 @@ use crate::game::quantity::resolve_quantity;
 use crate::game::{targeting, zones};
 use crate::types::ability::{
     ContinuousModification, Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter,
+    TargetRef,
 };
 #[cfg(test)]
 use crate::types::counter::CounterType;
@@ -26,6 +27,7 @@ pub fn resolve(
     // Extract fields from effect
     let (
         target_filter,
+        owner_filter,
         source_filter,
         enters_attacking,
         tapped,
@@ -35,6 +37,7 @@ pub fn resolve(
     ) = match &ability.effect {
         Effect::CopyTokenOf {
             target,
+            owner,
             source_filter,
             enters_attacking,
             tapped,
@@ -43,6 +46,7 @@ pub fn resolve(
             additional_modifications,
         } => (
             target,
+            owner,
             source_filter,
             *enters_attacking,
             *tapped,
@@ -53,6 +57,14 @@ pub fn resolve(
         _ => return Err(EffectError::MissingParam("CopyTokenOf".to_string())),
     };
     let count = resolve_quantity(state, &count_expr, ability.controller, ability.source_id).max(0);
+
+    // CR 109.4 + CR 111.2: The token's creator (and therefore controller) is
+    // determined by the `owner` filter. Resolved once, before the creation
+    // loops, through the same single-authority helper `Effect::Token` uses so
+    // "target opponent creates a token that's a copy of it" places the copy
+    // under the chosen opponent's control rather than the trigger controller's.
+    let token_owner =
+        crate::game::effects::token::resolve_token_owner(state, ability, owner_filter);
 
     // Step 1: Resolve the copy source list.
     // CR 608.2c + 603.10a: LTB self-trigger patterns such as Vaultborn Tyrant
@@ -101,8 +113,31 @@ pub fn resolve(
         // `CopyTokenOf { target: SelfRef }` sub-ability would inherit the
         // parent's targets via chain propagation in
         // `effects::mod.rs::resolve_ability_chain` (issue #323 class).
+        //
+        // CR 109.4 + CR 115.1: `CopyTokenOf` may carry a *player* target in
+        // `ability.targets` — the `owner` slot for "target opponent creates a
+        // token that's a copy of it" (Wedding Ring). The copy *source* axis is
+        // object-only, so a context-ref source (`ParentTarget` / `None`) would
+        // otherwise see the owner player as a non-empty `ability.targets` and
+        // fail to fall back to the source object. Resolve against an
+        // object-only view so the two axes never cross-contaminate.
+        let object_only_ability;
+        let resolution_ability = if ability
+            .targets
+            .iter()
+            .any(|t| matches!(t, TargetRef::Player(_)))
+        {
+            let mut narrowed = ability.clone();
+            narrowed
+                .targets
+                .retain(|t| matches!(t, TargetRef::Object(_)));
+            object_only_ability = narrowed;
+            &object_only_ability
+        } else {
+            ability
+        };
         let effective_targets =
-            crate::game::targeting::resolved_targets(ability, target_filter, state);
+            crate::game::targeting::resolved_targets(resolution_ability, target_filter, state);
         crate::game::effects::effect_object_targets(target_filter, &effective_targets)
     };
 
@@ -148,7 +183,7 @@ pub fn resolve(
             let token_id = zones::create_object(
                 state,
                 CardId(0),
-                ability.controller,
+                token_owner,
                 name.clone(),
                 Zone::Battlefield,
             );
@@ -463,6 +498,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::CopyTokenOf {
                 target: TargetFilter::SelfRef,
+                owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
                 tapped: false,
@@ -533,6 +569,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::CopyTokenOf {
                 target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
                 tapped: false,
@@ -555,6 +592,98 @@ mod tests {
         assert!(token.is_token);
     }
 
+    /// CR 109.4 + CR 111.2: "target opponent creates a token that's a copy of
+    /// it" — the copy token must enter under the chosen opponent's control,
+    /// not the trigger controller's. Pins the new `owner` channel at the
+    /// building-block level (issue #403 defect 1).
+    #[test]
+    fn copy_token_of_owner_creates_under_chosen_player() {
+        let mut state = GameState::new_two_player(42);
+
+        // The copy source — a permanent controlled by PlayerId(0).
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Wedding Ring".to_string(),
+            Zone::Battlefield,
+        );
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                // Copy source stays Wedding Ring itself.
+                target: TargetFilter::SelfRef,
+                // Non-context-ref owner filter — resolved from `ability.targets`.
+                owner: TargetFilter::Typed(
+                    crate::types::ability::TypedFilter::default()
+                        .controller(crate::types::ability::ControllerRef::Opponent),
+                ),
+                source_filter: None,
+                enters_attacking: false,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            // The chosen opponent target.
+            vec![TargetRef::Player(PlayerId(1))],
+            source_id,
+            // Wedding Ring's trigger controller is PlayerId(0).
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        // The token is a copy of Wedding Ring (the source), not a player.
+        assert_eq!(token.name, "Wedding Ring");
+        assert!(token.is_token);
+        // CR 109.4: the token is controlled (and owned) by the chosen opponent.
+        assert_eq!(
+            token.controller,
+            PlayerId(1),
+            "copy token must be controlled by the chosen opponent, not the trigger controller"
+        );
+        assert_eq!(token.owner, PlayerId(1));
+    }
+
+    /// CR 109.4: the default `owner` of `TargetFilter::Controller` keeps the
+    /// copy under the resolving ability's controller (the common case —
+    /// populate, "you create a token that's a copy of …").
+    #[test]
+    fn copy_token_of_default_owner_is_controller() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Llanowar Elves".to_string(),
+            Zone::Battlefield,
+        );
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::SelfRef,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+        let token_id = ObjectId(state.next_object_id - 1);
+        let token = state.objects.get(&token_id).unwrap();
+        assert_eq!(token.controller, PlayerId(0));
+    }
+
     /// CR 609.3 + CR 101.3: An unattached Springheart Nantuko resolves
     /// `CopyTokenOf { target: AttachedTo }` with no host — `AttachedTo`
     /// resolves empty. The effect must be a clean zero-token no-op (no token
@@ -575,6 +704,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::CopyTokenOf {
                 target: TargetFilter::AttachedTo,
+                owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
                 tapped: false,
@@ -644,6 +774,7 @@ mod tests {
         let mut ability = ResolvedAbility::new(
             Effect::CopyTokenOf {
                 target: TargetFilter::CostPaidObject,
+                owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
                 tapped: false,
@@ -710,6 +841,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::CopyTokenOf {
                 target: TargetFilter::ParentTarget,
+                owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
                 tapped: false,
@@ -760,6 +892,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::CopyTokenOf {
                 target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: true,
                 tapped: true,
@@ -812,6 +945,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::CopyTokenOf {
                 target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
                 tapped: false,
@@ -877,6 +1011,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::CopyTokenOf {
                 target: TargetFilter::ParentTarget,
+                owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
                 tapped: false,
@@ -961,6 +1096,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::CopyTokenOf {
                 target: TargetFilter::ParentTarget,
+                owner: TargetFilter::Controller,
                 source_filter: Some(TargetFilter::Typed(TypedFilter {
                     type_filters: vec![],
                     controller: Some(ControllerRef::You),
@@ -1021,6 +1157,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::CopyTokenOf {
                 target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
                 tapped: false,
@@ -1092,6 +1229,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::CopyTokenOf {
                 target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
                 tapped: false,
@@ -1157,6 +1295,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::CopyTokenOf {
                 target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
                 tapped: false,
@@ -1273,6 +1412,7 @@ mod tests {
                     controller: None,
                     properties: vec![FilterProp::EquippedBy],
                 }),
+                owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
                 tapped: false,

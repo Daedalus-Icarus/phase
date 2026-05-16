@@ -129,7 +129,7 @@ pub enum TriggerMode {
     Shuffled,
 
     // Life — CR 119 (Life)
-    /// CR 119.4: Triggers when a player gains life.
+    /// CR 119.3: Triggers when a player gains life.
     LifeGained,
     /// CR 119.3: Triggers when a player loses life.
     LifeLost,

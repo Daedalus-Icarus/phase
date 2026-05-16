@@ -1373,6 +1373,7 @@ pub fn synthesize_offspring(face: &mut CardFace) {
         AbilityKind::Spell,
         Effect::CopyTokenOf {
             target: TargetFilter::SelfRef,
+            owner: TargetFilter::Controller,
             source_filter: None,
             enters_attacking: false,
             tapped: false,

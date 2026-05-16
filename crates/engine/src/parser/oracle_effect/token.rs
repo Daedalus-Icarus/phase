@@ -97,6 +97,9 @@ pub(super) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) 
         }
         return Some(Effect::CopyTokenOf {
             target,
+            // CR 109.4: Default to the controller; a "target [player] creates"
+            // subject is lifted into `owner` later by `inject_subject_target`.
+            owner: TargetFilter::Controller,
             source_filter: None,
             enters_attacking,
             tapped,
@@ -968,6 +971,25 @@ mod tests {
         let Effect::CopyTokenOf { target, .. } = effect else {
             panic!("expected CopyTokenOf, got {effect:?}");
         };
+        assert_eq!(target, TargetFilter::ParentTarget);
+    }
+
+    /// CR 109.4: `try_parse_token` emits the default `owner` of
+    /// `TargetFilter::Controller`; a "target [player] creates" subject is
+    /// lifted into `owner` later by `inject_subject_target` (issue #403).
+    #[test]
+    fn copy_token_emits_default_controller_owner() {
+        let effect = try_parse_token(
+            "create a token that's a copy of it",
+            "Create a token that's a copy of it",
+            &mut ParseContext::default(),
+        )
+        .expect("expected CopyTokenOf");
+        let Effect::CopyTokenOf { owner, target, .. } = effect else {
+            panic!("expected CopyTokenOf, got {effect:?}");
+        };
+        assert_eq!(owner, TargetFilter::Controller);
+        // The copy source is left as the context ref — not overwritten.
         assert_eq!(target, TargetFilter::ParentTarget);
     }
 

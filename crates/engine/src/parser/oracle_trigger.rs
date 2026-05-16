@@ -1999,6 +1999,23 @@ fn extract_if_condition(text: &str) -> (String, Option<TriggerCondition>) {
         return result;
     }
 
+    // CR 603.4 + CR 601.2: "if it was cast" — the entering permanent must have
+    // been cast (not put onto the battlefield by another effect). Wedding
+    // Ring's ETB token-copy is gated this way so the created copy *token* —
+    // which is not cast — does not re-trigger the ability infinitely. The
+    // literal "if it was cast" is not a substring of "if it wasn't cast"
+    // (the latter has "wasn't", not "was cast"), so the two arms are disjoint.
+    // NOTE: if a zone-specific "if it was cast from <zone>" trigger arm is ever
+    // added, it must be ordered BEFORE this one — "if it was cast" is a prefix
+    // of "if it was cast from your hand" and would shadow it here.
+    let was_cast_pos = tp.find("if it was cast"); // allow-noncombinator: anchor for strip_condition_clause — structural if-clause excision, not parse dispatch
+    if let Some(pos) = was_cast_pos {
+        return (
+            strip_condition_clause(text, pos, "if it was cast".len()),
+            Some(TriggerCondition::WasCast),
+        );
+    }
+
     // CR 603.4 + CR 601.2: "if it wasn't cast" — negation of WasCast.
     if let Some(pos) = tp.find("if it wasn't cast") {
         return (
@@ -4164,10 +4181,15 @@ fn try_parse_event(
         ))
         .parse(input)
     }
-    if let Ok((_, mode)) = parse_life_verb.parse(rest) {
+    if let Ok((tail, mode)) = parse_life_verb.parse(rest) {
         let mut def = make_base();
         def.mode = mode.clone();
         def.valid_target = Some(subject.clone());
+        // CR 603.4 + CR 102.1: "gains life during their turn" / "loses life
+        // during their turn" — the trailing timing tail restricts the trigger
+        // to the acting player's own turn. Composed with the shared typed
+        // `parse_timing_tail` combinator rather than a bespoke strip.
+        attach_event_timing_tail(&mut def, tail);
         return Some((mode, def));
     }
 
@@ -4182,10 +4204,14 @@ fn try_parse_event(
         ))
         .parse(input)
     }
-    if parse_draws_card.parse(rest).is_ok() {
+    if let Ok((tail, ())) = parse_draws_card.parse(rest) {
         let mut def = make_base();
         def.mode = TriggerMode::Drawn;
         def.valid_target = Some(subject.clone());
+        // CR 603.4 + CR 102.1: "draws a card during their turn" — the trailing
+        // timing tail restricts the trigger to the acting player's own turn.
+        // Composed with the shared typed `parse_timing_tail` combinator.
+        attach_event_timing_tail(&mut def, tail);
         // CR 121.1 + CR 504.1 + CR 603.4: Detect Orcish Bowmasters' "except the
         // first one [you|they] draw in each of [your|their] draw steps" clause
         // (shape-compatible with Alhammarret's Archive's replacement variant —
@@ -5839,6 +5865,32 @@ fn timing_condition(timing: NthEventTimingKind) -> Option<TriggerCondition> {
             player: PlayerFilter::TriggeringPlayer,
         }),
     }
+}
+
+/// CR 603.4 + CR 102.1: Attach a trailing timing tail (e.g. "during their
+/// turn") parsed off a draw / life-gain / life-loss trigger predicate to the
+/// produced `TriggerDefinition`. The tail is dispatched through the shared
+/// typed `parse_timing_tail` combinator; a recognized restricted tail becomes
+/// a `DuringPlayersTurn` intervening-if condition. An empty / unrecognized
+/// tail leaves the definition unrestricted. When the definition already
+/// carries a condition, the timing restriction is ANDed in.
+fn attach_event_timing_tail(def: &mut TriggerDefinition, tail: &str) {
+    let trimmed = tail.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let Ok((_, kind)) = parse_timing_tail(trimmed) else {
+        return;
+    };
+    let Some(timing) = timing_condition(kind) else {
+        return;
+    };
+    def.condition = Some(match def.condition.take() {
+        Some(existing) => TriggerCondition::And {
+            conditions: vec![existing, timing],
+        },
+        None => timing,
+    });
 }
 
 /// Nom combinator for a complete timing-tail clause: matches "each turn",
@@ -10272,6 +10324,54 @@ mod tests {
                 TypedFilter::default().controller(ControllerRef::Opponent)
             ))
         );
+    }
+
+    /// CR 603.4 + CR 102.1: "draws a card during their turn" — the trailing
+    /// timing tail restricts the trigger to the drawing player's own turn
+    /// (issue #403 defect 2a).
+    #[test]
+    fn trigger_draws_a_card_during_their_turn_attaches_actors_turn_timing() {
+        let def = parse_trigger_line(
+            "Whenever a player draws a card during their turn, you draw a card.",
+            "Test Card",
+        );
+        assert_eq!(def.mode, TriggerMode::Drawn);
+        assert_eq!(
+            def.condition,
+            Some(TriggerCondition::DuringPlayersTurn {
+                player: PlayerFilter::TriggeringPlayer,
+            }),
+            "the 'during their turn' tail must become a DuringPlayersTurn intervening-if"
+        );
+    }
+
+    /// CR 603.4 + CR 102.1: "gains life during their turn" — same timing-tail
+    /// composition for the life-gain predicate (issue #403 defect 2a).
+    #[test]
+    fn trigger_gains_life_during_their_turn_attaches_actors_turn_timing() {
+        let def = parse_trigger_line(
+            "Whenever a player gains life during their turn, you draw a card.",
+            "Test Card",
+        );
+        assert_eq!(def.mode, TriggerMode::LifeGained);
+        assert_eq!(
+            def.condition,
+            Some(TriggerCondition::DuringPlayersTurn {
+                player: PlayerFilter::TriggeringPlayer,
+            })
+        );
+    }
+
+    /// Regression guard: a plain draw trigger with no timing tail must remain
+    /// unconditional.
+    #[test]
+    fn trigger_draws_a_card_without_timing_tail_has_no_condition() {
+        let def = parse_trigger_line(
+            "Whenever a player draws a card, you draw a card.",
+            "Test Card",
+        );
+        assert_eq!(def.mode, TriggerMode::Drawn);
+        assert_eq!(def.condition, None);
     }
 
     #[test]

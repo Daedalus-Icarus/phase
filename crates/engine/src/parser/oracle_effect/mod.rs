@@ -2348,6 +2348,7 @@ fn try_parse_for_each_copy_token_source(
     }
     Some(parsed_clause(Effect::CopyTokenOf {
         target: TargetFilter::None,
+        owner: TargetFilter::Controller,
         source_filter: Some(source_filter),
         enters_attacking,
         tapped,
@@ -7666,6 +7667,15 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
         Effect::Token { ref mut owner, .. } if *owner == TargetFilter::Controller => {
             *owner = subject_filter;
         }
+        // CR 109.4 + CR 707.2: "target opponent creates a token that's a copy
+        // of it" — the chosen player is the token's creator/controller, not the
+        // copy source. Inject the subject into `owner` (mirrors `Effect::Token`
+        // above); `target` is left untouched so it keeps the copy *source*
+        // (SelfRef/ParentTarget). Placed before the object-targeting group so
+        // the `owner` channel wins over the `target == Any` injection.
+        Effect::CopyTokenOf { ref mut owner, .. } if *owner == TargetFilter::Controller => {
+            *owner = subject_filter;
+        }
         // CR 701.14a: "enchanted creature fights target creature" — the subject
         // of the fight is the enchanted/equipped creature, not the Aura/Equipment.
         Effect::Fight {
@@ -11530,6 +11540,7 @@ fn rewrite_those_tokens_from_antecedent(cur: &mut Effect, antecedent: &Effect) {
     let new_effect = match antecedent {
         Effect::CopyTokenOf {
             target,
+            owner,
             enters_attacking,
             tapped,
             extra_keywords,
@@ -11537,6 +11548,7 @@ fn rewrite_those_tokens_from_antecedent(cur: &mut Effect, antecedent: &Effect) {
             ..
         } => Some(Effect::CopyTokenOf {
             target: target.clone(),
+            owner: owner.clone(),
             source_filter: None,
             enters_attacking: *enters_attacking,
             tapped: *tapped,
@@ -27076,6 +27088,38 @@ mod tests {
             "expected Pump with SelfRef target, got: {:?}",
             clause.effect
         );
+    }
+
+    /// CR 109.4 + CR 707.2: "target opponent creates a token that's a copy of
+    /// it" — `inject_subject_target` lifts the chosen opponent into the
+    /// `CopyTokenOf.owner` channel; the copy source (`target`) is left intact
+    /// as the context ref (issue #403 defect 1).
+    #[test]
+    fn inject_subject_target_copy_token_owner() {
+        let clause = parse_effect_clause(
+            "target opponent creates a token that's a copy of it",
+            &mut ParseContext::default(),
+        );
+        match &clause.effect {
+            Effect::CopyTokenOf { owner, target, .. } => {
+                assert_ne!(
+                    *owner,
+                    TargetFilter::Controller,
+                    "the 'target opponent' subject must be lifted into `owner`"
+                );
+                assert!(
+                    target_filter_can_target_player(owner),
+                    "`owner` must be a player-directed filter, got {owner:?}"
+                );
+                // The copy source stays a context ref (the token copies the
+                // source object, never the opponent player).
+                assert!(
+                    matches!(target, TargetFilter::ParentTarget | TargetFilter::SelfRef),
+                    "copy source must remain a context ref, got {target:?}"
+                );
+            }
+            other => panic!("expected CopyTokenOf, got: {other:?}"),
+        }
     }
 
     #[test]

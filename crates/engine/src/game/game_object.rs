@@ -903,6 +903,11 @@ impl GameObject {
         // this permanent to the battlefield. When the permanent leaves, the value
         // is no longer meaningful; a re-cast will re-populate it via `finalize_cast`.
         self.cost_x_paid = None;
+        // CR 400.7 + CR 603.4: `cast_from_zone` records how this permanent
+        // arrived on the battlefield, kept alive so `WasCast` ETB intervening-if
+        // re-checks resolve correctly. A permanent that leaves the battlefield
+        // is a new object on any re-entry — clear the stale cast provenance.
+        self.cast_from_zone = None;
         self.convoked_creatures.clear();
         // CR 702.103f: `bestow_form` is intentionally NOT cleared here.
         // The zone-exit cleanup in `apply_zone_exit_cleanup` (zones.rs) reads

@@ -1141,9 +1141,9 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
             // cost paid. Applies to both printed Casualty (obj.additional_cost
             // is set) and dynamically granted Casualty (e.g. from Silverquill).
             // The WasCast intervening-if is intentionally omitted: the trigger
-            // only fires on SpellCast (which is only emitted for actual casts),
-            // and obj.cast_from_zone is cleared after trigger collection so a
-            // WasCast check at resolution would always fail.
+            // only fires on SpellCast, which is only emitted for an actual
+            // cast — so the cast-ness is already implied by the trigger event
+            // itself and a redundant WasCast condition would add nothing.
             // CR 702.153a: Skip cards with a printed Casualty keyword — those
             // already have the copy trigger from synthesize_casualty (face-level
             // trigger synthesis). Only cards whose Casualty is dynamically
@@ -1199,10 +1199,10 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
                 pending.push(PendingTriggerContext::single(PendingTrigger {
                     source_id: *cast_obj_id,
                     controller: dynamically_granted_casualty_instances.1,
-                    // No WasCast intervening-if: SpellCast only fires for actual
-                    // casts, and cast_from_zone is cleared after trigger collection
-                    // so WasCast would always fail at resolution. The copy is gated
-                    // instead by AbilityCondition::additional_cost_paid_any() inside
+                    // No WasCast intervening-if: SpellCast only fires for an
+                    // actual cast, so cast-ness is already implied by the
+                    // trigger event itself. The copy is gated instead by
+                    // AbilityCondition::additional_cost_paid_any() inside
                     // casualty_copy_ability_definition(), which reads the already-set
                     // `ability.context.additional_cost_paid = true` above.
                     condition: None,
@@ -1493,18 +1493,27 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
         }
     }
 
-    // Clear transient cast_from_zone and the cast-tally booleans/color breakdown
-    // on all objects after trigger collection. These fields only need to survive
-    // long enough for ETB trigger detection (CR 603.4). `mana_spent_to_cast_amount`
-    // is intentionally NOT cleared: it is a historical fact about the object
-    // (how much mana was spent to cast it) used by spell resolution effects
-    // like "deals damage equal to the amount of mana spent to cast this spell"
-    // (Molten Note) and by CR 603.4 intervening-if resolution re-checks
-    // (Hungry Graffalon / Topiary Lecturer Increment). The field is initialized
-    // to 0 by `GameObject::new` and set at cast finalization in
-    // `casting::pay_mana_cost`; it never needs to be reset.
+    // Clear transient cast-tally booleans/color breakdown on all objects after
+    // trigger collection. `mana_spent_to_cast_amount` is intentionally NOT
+    // cleared: it is a historical fact about the object (how much mana was
+    // spent to cast it) used by spell resolution effects like "deals damage
+    // equal to the amount of mana spent to cast this spell" (Molten Note) and
+    // by CR 603.4 intervening-if resolution re-checks (Hungry Graffalon /
+    // Topiary Lecturer Increment).
+    //
+    // CR 603.4: `cast_from_zone` is likewise preserved for permanents on the
+    // battlefield — a `WasCast` / "if you cast it" ETB intervening-if is
+    // re-checked when the triggered ability *resolves* (`stack.rs`), not only
+    // when it is collected. Clearing it on all objects here would make every
+    // `WasCast`-conditioned ETB trigger (Wedding Ring's token-copy, Discover
+    // ETBs) silently do nothing at resolution. It is still cleared for
+    // non-battlefield objects (a fizzled stack spell, an object that bounced)
+    // since their cast provenance is no longer meaningful, and is cleared on
+    // battlefield exit by `reset_for_battlefield_exit`.
     for obj in state.objects.iter_mut().map(|(_, v)| v) {
-        obj.cast_from_zone = None;
+        if obj.zone != Zone::Battlefield {
+            obj.cast_from_zone = None;
+        }
         obj.mana_spent_to_cast = false;
         obj.colors_spent_to_cast = crate::types::mana::ColoredManaCount::default();
     }
@@ -7320,6 +7329,7 @@ pub mod tests {
     fn extract_target_skips_copy_token_source_filter() {
         let effect = Effect::CopyTokenOf {
             target: TargetFilter::None,
+            owner: TargetFilter::Controller,
             source_filter: Some(TargetFilter::Typed(
                 TypedFilter::default()
                     .controller(ControllerRef::You)

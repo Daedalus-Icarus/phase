@@ -4738,6 +4738,13 @@ pub enum Effect {
         /// Any/Typed are selected as targets when `source_filter` is absent.
         #[serde(default = "default_target_filter_any")]
         target: TargetFilter,
+        /// CR 109.4: The player who creates (and therefore controls) the copy
+        /// token(s). Mirrors `Effect::Token.owner` — defaults to
+        /// `TargetFilter::Controller`, but "target opponent creates a token
+        /// that's a copy of it" lifts the chosen opponent into this field via
+        /// `inject_subject_target`. The copy *source* stays in `target`.
+        #[serde(default = "default_target_filter_controller")]
+        owner: TargetFilter,
         /// CR 115.1 + CR 608.2c: Non-targeting copy source set for "for each
         /// [object], create a token that's a copy of it" effects. These objects
         /// are chosen by the effect at resolution, not by target declaration.
@@ -6301,11 +6308,36 @@ impl Effect {
             | Effect::GiveControl { target, .. }
             | Effect::RemoveFromCombat { target, .. } => Some(target),
 
+            // CR 109.4 + CR 115.1 + CR 707.2: `CopyTokenOf` has two
+            // potentially-targetable axes — the copy *source* (`target`) and
+            // the token *creator/owner* (`owner`). `target_filter()` surfaces
+            // exactly one as the stack-push target slot:
+            //  * When the copy source is a declared target (`source_filter` is
+            //    `None` and `target` is a real targetable filter, e.g.
+            //    "create a token that's a copy of target creature"), the
+            //    copy-source axis wins — it must keep its slot.
+            //  * Otherwise the copy source is a context ref (`SelfRef` /
+            //    `ParentTarget` — Wedding Ring, Twinflame Strike) or a
+            //    non-targeting `source_filter` set, so the copy-source axis
+            //    needs no slot; the `owner` filter is surfaced instead so
+            //    "target opponent creates a token that's a copy of it" can
+            //    declare the opponent as a target. This mirrors `Effect::Token`
+            //    below, which surfaces its `owner` unconditionally.
+            // No real card targets both axes at once; if one ever exists, the
+            // copy-source axis is surfaced and `owner` resolution falls back to
+            // the controller (documented at `token::resolve_token_owner`).
             Effect::CopyTokenOf {
                 target,
+                owner,
                 source_filter,
                 ..
-            } => source_filter.is_none().then_some(target),
+            } => {
+                if source_filter.is_none() && !target.is_context_ref() {
+                    Some(target)
+                } else {
+                    Some(owner)
+                }
+            }
 
             Effect::ExileTop { player, .. } | Effect::ExileFromTopUntil { player, .. } => {
                 Some(player)
