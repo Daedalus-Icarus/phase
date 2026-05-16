@@ -575,11 +575,15 @@ pub(crate) fn extract_source_from_event(
             attacker_ids.first().copied()
         }
         // CR 509.1: For a `Blocks` / `AttacksOrBlocks` trigger, "it" / the
-        // triggering source is the creature that blocked. When exactly one
-        // blocker was declared the event source is unambiguous; mirrors the
-        // single-attacker `AttackersDeclared` arm above.
-        GameEvent::BlockersDeclared { assignments } if assignments.len() == 1 => {
-            assignments.first().map(|(blocker, _)| *blocker)
+        // triggering source is the creature that blocked. A single creature
+        // blocking multiple attackers yields one `(blocker, attacker)` entry
+        // per attacker, all sharing the same blocker — still an unambiguous
+        // source. The source is only ambiguous when distinct blockers were
+        // declared, in which case no single triggering object exists.
+        GameEvent::BlockersDeclared { assignments } => {
+            let mut blockers = assignments.iter().map(|(blocker, _)| *blocker);
+            let first = blockers.next()?;
+            blockers.all(|blocker| blocker == first).then_some(first)
         }
         _ => None,
     }

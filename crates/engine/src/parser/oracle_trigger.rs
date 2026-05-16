@@ -4221,7 +4221,16 @@ fn try_parse_event(
         if super::oracle_replacement::has_except_first_draw_in_draw_step_clause(rest)
             || super::oracle_replacement::has_except_first_draw_in_draw_step_clause(full_lower)
         {
-            def.condition = Some(TriggerCondition::ExceptFirstDrawInDrawStep);
+            // CR 121.1: AND the draw-step exemption into any timing condition
+            // `attach_event_timing_tail` already set (e.g. "during their turn")
+            // rather than clobbering it. When the tail set no condition this is
+            // identical to assigning `ExceptFirstDrawInDrawStep` directly.
+            def.condition = Some(match def.condition.take() {
+                Some(existing) => TriggerCondition::And {
+                    conditions: vec![existing, TriggerCondition::ExceptFirstDrawInDrawStep],
+                },
+                None => TriggerCondition::ExceptFirstDrawInDrawStep,
+            });
         }
         return Some((TriggerMode::Drawn, def));
     }
