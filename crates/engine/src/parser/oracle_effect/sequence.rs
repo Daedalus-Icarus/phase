@@ -862,6 +862,13 @@ fn starts_bare_and_clause_lower(s: &str) -> bool {
         value((), tag("you surveil ")),
         value((), tag("you get ")),
         value((), tag("you may ")),
+        // CR 707.10c: "[subject] may copy this spell and may choose a new
+        // target for that copy" — the Chain cycle joins the optional copy and
+        // its retarget grant with "and". "may choose" begins a verb phrase,
+        // never a noun-phrase continuation, so the split is safe; it lets the
+        // retarget clause reach `parse_followup_continuation_ast` rather than
+        // being silently dropped as a `copy <target>` remainder.
+        value((), tag("may choose ")),
         value((), tag("its controller ")),
         value((), tag("their controller ")),
         // Sword trigger patterns
@@ -1013,16 +1020,28 @@ fn effect_wraps_copy_spell(effect: &Effect) -> bool {
     }
 }
 
-/// CR 707.10c: nom recognizer for the "you may choose new targets for the
-/// copy/copies" continuation clause that grants copy retargeting. Operates on
-/// lowercased text; tolerates a trailing period/whitespace.
+/// CR 707.10c: nom recognizer for the "[you] may choose [a] new target[s] for
+/// {the,that} copy/copies" continuation clause that grants copy retargeting.
+/// Operates on lowercased text; tolerates a trailing period/whitespace.
+///
+/// The clause is composed from independent axes rather than enumerated as full
+/// strings:
+///   - optional `"you "` subject ("You may choose ..." vs the bare "may choose
+///     ..." form produced by clause-splitting Chain of Smog's "... and may
+///     choose a new target for that copy").
+///   - singular/plural target ("a new target" / "new targets").
+///   - determiner ("the copy/copies" — Fork/Twincast; "that copy" — the Chain
+///     cycle's "a new target for that copy").
 fn recognize_copy_retarget_clause(lower: &str) -> bool {
     let clause = lower.trim().trim_end_matches('.').trim_end();
     value(
         (),
         (
-            tag::<_, _, OracleError<'_>>("you may choose new targets for "),
-            alt((tag("the copies"), tag("the copy"))),
+            opt(tag::<_, _, OracleError<'_>>("you ")),
+            tag("may choose "),
+            alt((tag("a new target "), tag("new targets "))),
+            tag("for "),
+            alt((tag("the copies"), tag("the copy"), tag("that copy"))),
             eof,
         ),
     )
@@ -1043,6 +1062,25 @@ fn set_copy_retarget(effect: &mut Effect, perm: CopyRetargetPermission) -> bool 
         }
         _ => false,
     }
+}
+
+/// CR 707.10c: Patch the `retarget` permission on the `CopySpell` reachable
+/// from this ability definition — its own effect, or a `CopySpell` carried as
+/// a (transitive) `sub_ability`. The Chain cycle (Chain of Acid / Plasma /
+/// Smog / Vapor) nests the optional copy under the parent effect ("Target
+/// player discards two cards. That player may copy this spell ..."), so the
+/// "and may choose a new target for that copy" continuation must descend the
+/// sub-ability chain rather than only inspecting the top-level effect.
+fn set_copy_retarget_in_ability(
+    def: &mut AbilityDefinition,
+    perm: &CopyRetargetPermission,
+) -> bool {
+    if set_copy_retarget(&mut def.effect, perm.clone()) {
+        return true;
+    }
+    def.sub_ability
+        .as_deref_mut()
+        .is_some_and(|sub| set_copy_retarget_in_ability(sub, perm))
 }
 
 pub(super) fn apply_clause_continuation(
@@ -1156,13 +1194,15 @@ pub(super) fn apply_clause_continuation(
             }
         }
         ContinuationAst::CopyMayRetarget => {
-            // CR 707.10c: patch the preceding CopySpell (descending through a
-            // CreateDelayedTrigger wrapper for "When you next cast ..., copy
-            // that spell" — Galvanic Iteration).
+            // CR 707.10c: patch the preceding CopySpell — descending through a
+            // CreateDelayedTrigger wrapper ("When you next cast ..., copy that
+            // spell" — Galvanic Iteration) and through the sub-ability chain
+            // ("That player may copy this spell ..." — the Chain cycle, where
+            // the optional CopySpell is nested under the parent discard).
             if let Some(previous) = defs.last_mut() {
-                set_copy_retarget(
-                    &mut previous.effect,
-                    CopyRetargetPermission::MayChooseNewTargets,
+                set_copy_retarget_in_ability(
+                    previous,
+                    &CopyRetargetPermission::MayChooseNewTargets,
                 );
             }
         }
@@ -2842,6 +2882,82 @@ mod tests {
         assert!(!starts_with_damage_clause("all creatures deal"));
         assert!(!starts_with_damage_clause("each player deals"));
         assert!(!starts_with_damage_clause("you lose 3 life"));
+    }
+
+    // --- CR 707.10c: copy-retarget clause recognition ---
+
+    #[test]
+    fn recognize_copy_retarget_clause_variants() {
+        // Fork / Twincast — "You may choose new targets for the copy/copies."
+        assert!(recognize_copy_retarget_clause(
+            "you may choose new targets for the copy."
+        ));
+        assert!(recognize_copy_retarget_clause(
+            "you may choose new targets for the copies"
+        ));
+        // The Chain cycle — "[and] may choose a new target for that copy"
+        // (no "you" subject after clause-splitting; singular; "that copy").
+        assert!(recognize_copy_retarget_clause(
+            "may choose a new target for that copy"
+        ));
+        assert!(recognize_copy_retarget_clause(
+            "you may choose a new target for that copy."
+        ));
+        // Negatives.
+        assert!(!recognize_copy_retarget_clause("copy that spell"));
+        assert!(!recognize_copy_retarget_clause(
+            "may choose a new target for the creature"
+        ));
+    }
+
+    #[test]
+    fn copy_retarget_followup_recognized_after_copy_spell() {
+        let copy = Effect::CopySpell {
+            target: TargetFilter::SelfRef,
+            retarget: CopyRetargetPermission::KeepOriginalTargets,
+        };
+        let result = parse_followup_continuation_ast(
+            "may choose a new target for that copy",
+            &copy,
+            &mut ParseContext::default(),
+        );
+        assert_eq!(result, Some(ContinuationAst::CopyMayRetarget));
+    }
+
+    /// CR 707.10c: `set_copy_retarget_in_ability` must descend the sub-ability
+    /// chain — the Chain cycle nests the optional `CopySpell` under its parent.
+    #[test]
+    fn set_copy_retarget_descends_into_sub_ability() {
+        let mut def = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Discard {
+                count: QuantityExpr::Fixed { value: 2 },
+                target: TargetFilter::Player,
+                random: false,
+                unless_filter: None,
+                filter: None,
+            },
+        );
+        def.sub_ability = Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::CopySpell {
+                target: TargetFilter::SelfRef,
+                retarget: CopyRetargetPermission::KeepOriginalTargets,
+            },
+        )));
+
+        assert!(set_copy_retarget_in_ability(
+            &mut def,
+            &CopyRetargetPermission::MayChooseNewTargets
+        ));
+        let sub = def.sub_ability.as_ref().unwrap();
+        assert!(matches!(
+            *sub.effect,
+            Effect::CopySpell {
+                retarget: CopyRetargetPermission::MayChooseNewTargets,
+                ..
+            }
+        ));
     }
 
     // --- parse_followup_continuation_ast: PutRest destination parsing ---

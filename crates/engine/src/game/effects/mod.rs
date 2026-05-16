@@ -1438,6 +1438,20 @@ fn optional_prompt_player(state: &GameState, ability: &ResolvedAbility) -> Playe
         }
     }
 
+    // CR 707.10 + CR 707.10c: "That player may copy this spell" (the Chain
+    // cycle — Chain of Acid / Plasma / Smog / Vapor). The optional copy
+    // sub-ability is offered to, and resolved by, the *targeted* player — not
+    // the original spell's caster. The targeted player arrives as a
+    // `TargetRef::Player` inherited from the parent effect's target list.
+    if matches!(ability.effect, Effect::CopySpell { .. }) {
+        if let Some(player) = ability.targets.iter().find_map(|t| match t {
+            TargetRef::Player(player) => Some(*player),
+            TargetRef::Object(_) => None,
+        }) {
+            return player;
+        }
+    }
+
     // Subject-anchored SearchLibrary: prompt the library owner / searcher.
     if let Effect::SearchLibrary {
         target_player: Some(TargetFilter::ParentTargetController),

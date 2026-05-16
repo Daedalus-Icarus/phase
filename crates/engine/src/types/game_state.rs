@@ -3546,6 +3546,22 @@ pub struct GameState {
     /// Used by event-context TargetFilter variants to resolve trigger event data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_trigger_event: Option<GameEvent>,
+    /// CR 707.10: Transient snapshot of the spell or ability stack entry
+    /// currently resolving. `resolve_top` pops the entry off `state.stack`
+    /// before running its effect, so a `CopySpell { target: SelfRef }` carried
+    /// as the resolving spell's own effect (the Chain cycle — Chain of Acid /
+    /// Plasma / Smog / Vapor — "you may copy this spell") can no longer find
+    /// itself on the stack. This holds the popped entry; `copy_spell::resolve`
+    /// falls back to it for `SelfRef`. Set by `resolve_top` before
+    /// `execute_effect` and cleared at the START of the next `resolve_top` —
+    /// it must survive a `WaitingFor::OptionalEffectChoice` round-trip (the
+    /// Chain cycle defers the copy past a player decision). For that same
+    /// reason it must be serialized: a server game persisted while a
+    /// Chain-cycle optional-copy prompt is pending and later reloaded would
+    /// otherwise lose the entry and silently drop the accepted copy. Mirrors
+    /// `current_trigger_event`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolving_stack_entry: Option<StackEntry>,
     /// Transient plural form of `current_trigger_event` for batched triggers.
     /// Event-context filters that can legally compare against a group read this.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3890,6 +3906,7 @@ impl GameState {
             pending_step_end_mana_handlers: Vec::new(),
             pending_phase_transition_progress: None,
             current_trigger_event: None,
+            resolving_stack_entry: None,
             current_trigger_events: Vec::new(),
             stack_trigger_event_batches: HashMap::new(),
             lki_cache: HashMap::new(),

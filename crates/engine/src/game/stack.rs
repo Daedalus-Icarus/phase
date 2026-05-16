@@ -72,6 +72,14 @@ fn move_prevented_permanent_spell_to_graveyard_if_still_on_stack(
 
 /// CR 608.2: Resolve the top object on the stack.
 pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    // CR 707.10: A fresh resolution invalidates any previously stashed
+    // resolving entry. `resolving_stack_entry` is set below and must persist
+    // across an optional-choice round-trip (the Chain cycle's "you may copy
+    // this spell" defers the copy past a player decision, by which point the
+    // spell has left the stack) — so it is cleared here at the start of the
+    // *next* resolution rather than at the end of this one.
+    state.resolving_stack_entry = None;
+
     // CR 405.5: When all players pass in succession, the top object on the stack resolves.
     let entry = match state.stack.pop_back() {
         Some(e) => e,
@@ -185,6 +193,14 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
             bestow_reverted_at_resolution = true;
         }
     }
+
+    // CR 707.10: Expose the resolving stack entry so a `CopySpell` carried as
+    // the spell's own effect (the Chain cycle's "you may copy this spell")
+    // can copy itself even though `resolve_top` has already popped it off the
+    // stack — and even after the spell has moved to the graveyard while an
+    // optional copy decision is pending. Cleared at the start of the next
+    // `resolve_top`.
+    state.resolving_stack_entry = Some(entry.clone());
 
     // Only run targeting validation and effect execution when an ability exists.
     // Permanent spells with no spell ability (ability is None) skip straight to

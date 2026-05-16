@@ -5,6 +5,7 @@ mod ashaya_nontoken_lands;
 mod aura_on_player;
 mod betor_lifelink_counters_repro;
 mod brigid_mana_ability;
+mod chain_of_smog_copy;
 mod coalition_relic_integration;
 mod council_of_four_nth_per_turn;
 mod cr_annotations;
