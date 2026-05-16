@@ -257,6 +257,138 @@ fn try_parse_opening_hand_reveal_delayed_trigger(
     Some(def)
 }
 
+/// CR 103.6 / CR 103.6a: Parse an "opening hand, begin the game with ~ on the
+/// battlefield" line into a `BeginGame` `AbilityDefinition`.
+///
+/// This is the sole detector for the begin-game class — the parser IS the
+/// detector. It is built entirely from nom combinators; the preamble is matched
+/// with explicit `alt`/`tag` over its known forms (never `take_until`, which
+/// would skip arbitrary text and weaken the detector).
+///
+/// Two pieces of text the previous hardcoded branch dropped are now captured:
+///   1. CR 122.1: an optional "with [N] [type] counter(s) on it" clause →
+///      populates `Effect::ChangeZone::enter_with_counters`.
+///   2. An optional "If you do, [effect]" follow-up sentence → becomes a
+///      `sub_ability` gated by `AbilityCondition::IfYouDo`, so the dependent
+///      effect only fires when the player accepts the begin-game opt-in.
+///
+/// Mirrors `try_parse_opening_hand_reveal_delayed_trigger` end-to-end shape and
+/// is near-isomorphic to Forsaken City's `optional: true` + `IfYouDo`
+/// sub-ability layout (Forsaken City proves `parse_effect_chain` handles the
+/// "exile a card from your hand" tail).
+fn parse_begin_game_clause(line: &str, lower: &str) -> Option<AbilityDefinition> {
+    // Closure consumes the structural prefix on the lowercased view. It returns
+    // the parsed entry counters; the original-case remainder (mapped back by
+    // `nom_on_lower`) is the "If you do, [effect]" tail — empty when absent.
+    let (enter_with_counters, effect_text) = nom_on_lower(line, lower, |input| {
+        // Preamble — explicit known forms, each ending in "you may ".
+        // CR 103.6a (begin the game with that card on the battlefield);
+        // Gemstone Caverns additionally gates on not being the starting player.
+        let (input, _) = alt((
+            tag(
+                "if this card is in your opening hand and you're not the starting player, you may ",
+            ),
+            tag("if this card is in your opening hand, you may "),
+            tag("if ~ is in your opening hand, you may "),
+        ))
+        .parse(input)?;
+        let (input, _) = tag("begin the game with ").parse(input)?;
+        // Self-reference: `~` after normalization, or an object pronoun.
+        let (input, _) =
+            alt((tag("~"), tag("it"), tag("him"), tag("her"), tag("them"))).parse(input)?;
+        let (input, _) = tag(" on the battlefield").parse(input)?;
+
+        // Optional "with [N] [type] counter(s) on it" clause (CR 122.1).
+        let (input, counters) = opt(parse_begin_game_counter_clause).parse(input)?;
+
+        // First sentence terminator.
+        let (input, _) = tag(".").parse(input)?;
+
+        // Optional "If you do, " follow-up prefix. When present, the remainder
+        // is the dependent effect text; when absent, the remainder is empty.
+        let (input, _) = opt(alt((tag(" if you do, "), tag(" if you do ")))).parse(input)?;
+
+        Ok((input, counters.unwrap_or_default()))
+    })?;
+
+    let mut def = AbilityDefinition::new(
+        AbilityKind::BeginGame,
+        // CR 103.6a: the card is put onto the battlefield from the opening hand.
+        Effect::ChangeZone {
+            destination: Zone::Battlefield,
+            target: TargetFilter::SelfRef,
+            origin: Some(Zone::Hand),
+            owner_library: false,
+            enter_transformed: false,
+            under_your_control: false,
+            enter_tapped: false,
+            enters_attacking: false,
+            up_to: false,
+            // CR 122.1: entry counters parsed from "with [N] [type] counter(s) on it".
+            enter_with_counters,
+        },
+    )
+    .description(line.to_string());
+    def.optional = true;
+
+    // Optional "If you do, [effect]" dependent sub-ability. A non-empty
+    // remainder means the line carried a follow-up sentence.
+    let effect_text = effect_text.trim().trim_end_matches('.').trim();
+    if !effect_text.is_empty() {
+        // CR 701.13a: "exile a card from your hand" resolves to a player-choice
+        // exile via `parse_effect_chain` (proven by Forsaken City's identical
+        // tail). The `IfYouDo` condition gates it so it only fires when the
+        // player accepted the begin-game opt-in.
+        let sub = parse_effect_chain(effect_text, AbilityKind::Spell);
+        if has_unimplemented(&sub) {
+            return None;
+        }
+        def = def.sub_ability(sub.condition(AbilityCondition::IfYouDo));
+    }
+
+    Some(def)
+}
+
+/// Parse the "with [N] [type] counter(s) on it" sub-clause of a begin-game line.
+///
+/// CR 122.1: counters placed on the permanent as it enters. The count defaults
+/// to 1 ("a"/"an") and the type word is canonicalized through
+/// `types::counter::parse_counter_type` (single authority).
+fn parse_begin_game_counter_clause(
+    input: &str,
+) -> super::oracle_nom::error::OracleResult<
+    '_,
+    Vec<(crate::types::counter::CounterType, QuantityExpr)>,
+> {
+    use nom::bytes::complete::take_while1;
+    use nom::character::complete::{char as nom_char, digit1};
+
+    let (input, _) = tag(" with ").parse(input)?;
+    // Count: a number, or the article "a"/"an" (→ 1).
+    let (input, count) = alt((
+        nom::combinator::map_res(digit1, |d: &str| d.parse::<u32>()),
+        value(1u32, alt((tag("an "), tag("a ")))),
+    ))
+    .parse(input)?;
+    let (input, _) = opt(nom_char(' ')).parse(input)?;
+    // Counter type word (e.g. "luck"). Canonicalized by the single authority.
+    let (input, type_word) =
+        take_while1(|c: char| c.is_ascii_alphabetic() || c == '-').parse(input)?;
+    let (input, _) = alt((tag(" counters"), tag(" counter"))).parse(input)?;
+    let (input, _) = tag(" on it").parse(input)?;
+
+    let counter_type = crate::types::counter::parse_counter_type(type_word);
+    Ok((
+        input,
+        vec![(
+            counter_type,
+            QuantityExpr::Fixed {
+                value: count as i32,
+            },
+        )],
+    ))
+}
+
 fn parsed_result_recently_granted_flashback(result: &ParsedAbilities) -> bool {
     result
         .abilities
@@ -2033,24 +2165,11 @@ pub(crate) fn parse_oracle_ir(
 
         // Priority 8c: "If this card is in your opening hand, you may begin the game with it on the battlefield"
         // CR 103.6: The Leyline rule — opt-in at game start, never compelled.
-        if is_opening_hand_begin_game(&lower) {
-            let mut def = AbilityDefinition::new(
-                AbilityKind::BeginGame,
-                Effect::ChangeZone {
-                    destination: crate::types::zones::Zone::Battlefield,
-                    target: crate::types::ability::TargetFilter::SelfRef,
-                    origin: Some(crate::types::zones::Zone::Hand),
-                    owner_library: false,
-                    enter_transformed: false,
-                    under_your_control: false,
-                    enter_tapped: false,
-                    enters_attacking: false,
-                    up_to: false,
-                    enter_with_counters: vec![],
-                },
-            )
-            .description(line.to_string());
-            def.optional = true;
+        // `parse_begin_game_clause` is the sole detector — the parser IS the
+        // detector; there is no string pre-filter. It also captures the
+        // optional "with [counters] on it" clause and the optional "If you do,
+        // [effect]" dependent sub-ability.
+        if let Some(def) = parse_begin_game_clause(&line, &lower) {
             result.abilities.push(def);
             i += 1;
             continue;
@@ -4738,6 +4857,96 @@ mod tests {
         assert!(matches!(filter, TargetFilter::Any));
         assert_eq!(*rest_destination, Some(Zone::Exile));
         assert!(!reveal);
+    }
+
+    /// CR 103.6a + CR 122.1 + CR 701.13a: Gemstone Caverns' begin-game line must
+    /// capture BOTH the "with a luck counter on it" entry counter AND the
+    /// "If you do, exile a card from your hand" dependent sub-ability gated by
+    /// `IfYouDo` — neither may be silently dropped.
+    #[test]
+    fn gemstone_caverns_begin_game_captures_counter_and_exile_sub_ability() {
+        let r = parse(
+            "If this card is in your opening hand and you're not the starting player, you may begin the game with Gemstone Caverns on the battlefield with a luck counter on it. If you do, exile a card from your hand.",
+            "Gemstone Caverns",
+            &[],
+            &["Land"],
+            &[],
+        );
+
+        assert_eq!(r.abilities.len(), 1);
+        let begin_game = &r.abilities[0];
+        assert_eq!(begin_game.kind, AbilityKind::BeginGame);
+        assert!(begin_game.optional);
+
+        let Effect::ChangeZone {
+            destination,
+            origin,
+            target,
+            enter_with_counters,
+            ..
+        } = &*begin_game.effect
+        else {
+            panic!("expected ChangeZone, got {:?}", begin_game.effect);
+        };
+        assert_eq!(*destination, Zone::Battlefield);
+        assert_eq!(*origin, Some(Zone::Hand));
+        assert!(matches!(target, TargetFilter::SelfRef));
+        assert_eq!(
+            enter_with_counters,
+            &vec![(
+                crate::types::counter::CounterType::Generic("luck".to_string()),
+                QuantityExpr::Fixed { value: 1 },
+            )],
+        );
+
+        let sub = begin_game
+            .sub_ability
+            .as_deref()
+            .expect("'If you do, exile a card from your hand' must create a sub-ability");
+        assert_eq!(sub.condition, Some(AbilityCondition::IfYouDo));
+        assert!(
+            !has_unimplemented(sub),
+            "exile-from-hand sub-ability must not be Unimplemented: {:?}",
+            sub.effect
+        );
+        assert!(matches!(
+            &*sub.effect,
+            Effect::ChangeZone {
+                origin: Some(Zone::Hand),
+                destination: Zone::Exile,
+                ..
+            }
+        ));
+    }
+
+    /// A Leyline-style begin-game line carries no counter clause and no
+    /// "If you do" follow-up — the optional clauses must be truly optional so
+    /// the branch is not over-fitted to Gemstone Caverns.
+    #[test]
+    fn leyline_begin_game_has_no_counters_or_sub_ability() {
+        let r = parse(
+            "If this card is in your opening hand, you may begin the game with it on the battlefield.\nYou have hexproof.",
+            "Leyline of Sanctity",
+            &[],
+            &["Enchantment"],
+            &[],
+        );
+
+        let begin_game = r
+            .abilities
+            .iter()
+            .find(|a| a.kind == AbilityKind::BeginGame)
+            .expect("Leyline begin-game ability must parse");
+        assert!(begin_game.optional);
+        assert!(begin_game.sub_ability.is_none());
+        let Effect::ChangeZone {
+            enter_with_counters,
+            ..
+        } = &*begin_game.effect
+        else {
+            panic!("expected ChangeZone, got {:?}", begin_game.effect);
+        };
+        assert!(enter_with_counters.is_empty());
     }
 
     /// CR 103.5b: Serum Powder's mulligan-time ability must classify as
