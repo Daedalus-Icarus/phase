@@ -266,9 +266,10 @@ fn discard_cost_populates_cost_paid_object() {
     );
 }
 
-/// CR 120.6 + Greater Good ruling (2020-08-07): sacrificing a 0-power creature
-/// draws zero cards, but the discard still happens — "If you don't have three
-/// cards in hand, you discard your hand." A 2-card hand is fully discarded.
+/// Greater Good ruling (2020-08-07): sacrificing a 0-power creature draws zero
+/// cards (the draw count is Greater Good's own Oracle text — `Power`), but the
+/// discard still happens — "If you don't have three cards in hand, you discard
+/// your hand." A 2-card hand is fully discarded.
 #[test]
 fn greater_good_zero_power_creature_draws_zero_still_discards() {
     let mut scenario = GameScenario::new();
