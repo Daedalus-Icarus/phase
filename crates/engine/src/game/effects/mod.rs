@@ -2040,13 +2040,17 @@ fn resolve_chain_body(
     events: &mut Vec<GameEvent>,
     depth: u32,
 ) -> Result<(), EffectError> {
-    // CR 608.2c: Snapshot whether a `pending_continuation` already existed at
-    // chain-body entry. An unrelated outer continuation (e.g. a `player_scope`
+    // CR 608.2c: Snapshot the `pending_continuation` *value* at chain-body
+    // entry so the sub_ability guard further down can compare by IDENTITY, not
+    // mere presence. An unrelated outer continuation (e.g. a `player_scope`
     // iteration's remaining-opponent queue) must NOT cause this chain's own
-    // `sub_ability` link to be skipped — only a continuation installed by THIS
-    // effect's resolver accounts for the sub. Consulted by the sub_ability
-    // guard further down (issue #491).
-    let pending_continuation_before = state.pending_continuation.is_some();
+    // `sub_ability` link to be skipped — only a continuation that THIS effect's
+    // resolver INSTALLED or REPLACED accounts for the sub. A bare `is_some()`
+    // count cannot distinguish "outer present, effect installed nothing" from
+    // "outer present, effect replaced it with its own" (e.g. `clash.rs` does a
+    // REPLACE, not an append) — both leave `is_some()` true. Comparing the full
+    // value catches the replace case correctly (issue #491).
+    let pending_continuation_before = state.pending_continuation.clone();
     // CR 608.2e: "Instead" kicker — check if a sub overrides the parent.
     // When condition is met, replace the current ability's effect with the sub's
     // effect, preserving the full resolution flow (tracked sets, continuations).
@@ -3022,16 +3026,23 @@ fn resolve_chain_body(
         // optional_effect_performed), the sub_ability chain is already
         // accounted for — skip to avoid double execution.
         //
-        // CR 608.2c: Only skip when THIS effect's resolution installed the
-        // continuation. A `pending_continuation` that already existed before
-        // the effect resolved belongs to an unrelated outer chain (e.g. a
-        // `player_scope` iteration's remaining-opponent queue) and does NOT
-        // account for this effect's own `sub_ability` — skipping then would
-        // silently drop the sub (issue #491: the `LoseLife→Draw` decline body
-        // would lose its `Draw` while another opponent's iteration is queued).
-        if state.pending_continuation.is_some()
-            && !pending_continuation_before
-            && !waits_for_resolution_choice(&state.waiting_for)
+        // CR 608.2c: Only skip when THIS effect's resolution INSTALLED or
+        // REPLACED the continuation. Compare by identity against the entry
+        // snapshot:
+        //   * `None` -> `Some(_)`  : effect installed a continuation -> skip.
+        //   * `Some(a)` -> `Some(b)` where `a != b` : effect replaced the
+        //     outer continuation with its own (clash injects a modified
+        //     `optional_effect_performed` context this way) -> skip; clash's
+        //     stashed continuation IS the `sub_ability`.
+        //   * `Some(a)` -> `Some(a)` (unchanged) : the continuation belongs to
+        //     an unrelated outer chain (e.g. a `player_scope` iteration's
+        //     remaining-opponent queue). It does NOT account for this effect's
+        //     own `sub_ability` — do NOT skip, or the sub is silently dropped
+        //     (issue #491: the `LoseLife→Draw` decline body would lose its
+        //     `Draw` while another opponent's iteration is queued).
+        let continuation_installed_by_this_effect = state.pending_continuation.is_some()
+            && state.pending_continuation != pending_continuation_before;
+        if continuation_installed_by_this_effect && !waits_for_resolution_choice(&state.waiting_for)
         {
             return Ok(());
         }

@@ -1198,12 +1198,14 @@ fn detect_dynamic_qty(
     // CR 608.2e + CR 109.5: "For each opponent who doesn't, <body>" is a
     // per-opponent decline iteration, NOT a dynamic quantity — its carrier is a
     // `player_scope: Opponent` node with a `Not{IfYouDo}`-conditioned
-    // decline-consequence sub-ability. When the sole "for each" marker is this
-    // decline phrase and the AST carries the `Not{IfYouDo}` decline gate, the
-    // clause IS represented; the DynamicQty warning is a false positive.
-    if cleaned_for_each_is_only_decline_iteration(cleaned)
-        && json_has_any(ast_json, &["\"Not\"", "\"IfYouDo\""])
-    {
+    // decline-consequence sub-ability. Suppress the warning only when the AST
+    // carries the `Not` wrapper specifically: a bare `IfYouDo` token is present
+    // on the opponent-sacrifice node of EVERY Braids-class AST regardless of
+    // whether the decline body actually attached, so checking for `IfYouDo`
+    // would suppress the warning even when the decline body failed to parse.
+    // The `Not` gate is what proves the decline-consequence clause is
+    // represented (issue #491 follow-up).
+    if cleaned_for_each_is_only_decline_iteration(cleaned) && json_has_any(ast_json, &["\"Not\""]) {
         return;
     }
     diagnostics.push(OracleDiagnostic::SwallowedClause {
