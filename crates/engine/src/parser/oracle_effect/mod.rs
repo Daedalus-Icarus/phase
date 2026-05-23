@@ -12855,7 +12855,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
     // actually choose cards from among them patch destination/keep_count before this
     // pass. Anything still in the raw private-Dig shape is a pure peek: skip
     // DigChoice and only populate last_revealed_ids for downstream conditions.
-    for i in 0..defs.len() {
+    for def in &mut defs {
         if let Effect::Dig {
             reveal: false,
             keep_count: None,
@@ -12863,9 +12863,9 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
             destination: None,
             rest_destination: None,
             ..
-        } = &*defs[i].effect
+        } = &*def.effect
         {
-            if let Effect::Dig { keep_count, .. } = &mut *defs[i].effect {
+            if let Effect::Dig { keep_count, .. } = &mut *def.effect {
                 *keep_count = Some(0);
             }
         }

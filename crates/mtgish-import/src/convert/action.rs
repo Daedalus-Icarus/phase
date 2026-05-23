@@ -2619,6 +2619,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
         // pure peek: no selection prompt, no zone move, and `last_revealed_ids`
         // is populated for follow-up conditions/actions.
         Action::LookAtTopOfLibrary => Effect::Dig {
+            player: TargetFilter::Controller,
             count: QuantityExpr::Fixed { value: 1 },
             destination: None,
             keep_count: Some(0),
@@ -4105,6 +4106,7 @@ fn convert_look_at_top(
         // `last_revealed_ids` without prompting for a selection.
         [L::PutTheRemainingCardsOnTopOfLibraryInAnyOrder]
         | [L::LeaveRemainingCardsOnTopOfLibraryInSameOrder] => Ok(Effect::Dig {
+            player: TargetFilter::Controller,
             count,
             destination: None,
             keep_count: Some(0),
@@ -4121,6 +4123,7 @@ fn convert_look_at_top(
         [L::PutAGenericCardIntoHand, L::PutTheRemainingCardsOnTheBottomOfLibraryInARandomOrder]
         | [L::PutAGenericCardIntoHand, L::PutTheRemainingCardsOnTheBottomOfLibraryInAnyOrder] => {
             Ok(Effect::Dig {
+                player: TargetFilter::Controller,
                 count,
                 destination: Some(Zone::Hand),
                 keep_count: Some(1),
@@ -4136,6 +4139,7 @@ fn convert_look_at_top(
         // family).
         [L::PutAGenericCardIntoGraveyard, L::PutTheRemainingCardsOnTopOfLibraryInAnyOrder] => {
             Ok(Effect::Dig {
+                player: TargetFilter::Controller,
                 count,
                 destination: Some(Zone::Graveyard),
                 keep_count: Some(1),
@@ -4154,6 +4158,7 @@ fn convert_look_at_top(
         [L::MayRevealACardOfTypeAndPutIntoHand(cards), L::PutTheRemainingCardsOnTheBottomOfLibraryInARandomOrder]
         | [L::MayRevealACardOfTypeAndPutIntoHand(cards), L::PutTheRemainingCardsOnTheBottomOfLibraryInAnyOrder] => {
             Ok(Effect::Dig {
+                player: TargetFilter::Controller,
                 count,
                 destination: Some(Zone::Hand),
                 keep_count: Some(1),
@@ -4168,6 +4173,7 @@ fn convert_look_at_top(
         // then put the rest into your graveyard."
         [L::MayRevealACardOfTypeAndPutIntoHand(cards), L::PutTheRemainingCardsIntoGraveyard] => {
             Ok(Effect::Dig {
+                player: TargetFilter::Controller,
                 count,
                 destination: Some(Zone::Hand),
                 keep_count: Some(1),
@@ -4225,6 +4231,7 @@ fn convert_reveal_top_dig(
     match dispositions {
         [RevealTheTopNumberCardsOfLibraryAction::MayPutACardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsIntoGraveyard] => {
             Ok(Effect::Dig {
+                player: TargetFilter::Controller,
                 count,
                 destination: Some(Zone::Hand),
                 keep_count: Some(1),
@@ -4236,6 +4243,7 @@ fn convert_reveal_top_dig(
         }
         [RevealTheTopNumberCardsOfLibraryAction::PutACardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsIntoGraveyard] => {
             Ok(Effect::Dig {
+                player: TargetFilter::Controller,
                 count,
                 destination: Some(Zone::Hand),
                 keep_count: Some(1),
@@ -4247,6 +4255,7 @@ fn convert_reveal_top_dig(
         }
         [RevealTheTopNumberCardsOfLibraryAction::PutAGenericCardIntoHand, RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsIntoGraveyard] => {
             Ok(Effect::Dig {
+                player: TargetFilter::Controller,
                 count,
                 destination: Some(Zone::Hand),
                 keep_count: Some(1),
@@ -4259,6 +4268,7 @@ fn convert_reveal_top_dig(
         [RevealTheTopNumberCardsOfLibraryAction::MayPutACardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsOnTheBottomOfLibraryInAnyOrder]
         | [RevealTheTopNumberCardsOfLibraryAction::MayPutACardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsOnTheBottomOfLibraryInARandomOrder] => {
             Ok(Effect::Dig {
+                player: TargetFilter::Controller,
                 count,
                 destination: Some(Zone::Hand),
                 keep_count: Some(1),
@@ -4271,6 +4281,7 @@ fn convert_reveal_top_dig(
         [RevealTheTopNumberCardsOfLibraryAction::PutACardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsOnTheBottomOfLibraryInAnyOrder]
         | [RevealTheTopNumberCardsOfLibraryAction::PutACardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsOnTheBottomOfLibraryInARandomOrder] => {
             Ok(Effect::Dig {
+                player: TargetFilter::Controller,
                 count,
                 destination: Some(Zone::Hand),
                 keep_count: Some(1),
