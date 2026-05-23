@@ -5824,6 +5824,9 @@ fn lower_imperative_clause(text: &str, ctx: &mut ParseContext) -> ParsedEffectCl
     {
         clause.multi_target = extract_exile_multi_target(text);
     }
+    if matches!(clause.effect, Effect::DealDamage { .. }) && clause.multi_target.is_none() {
+        clause.multi_target = extract_deal_damage_multi_target(text);
+    }
     clause
 }
 
@@ -14138,6 +14141,29 @@ fn extract_exile_multi_target(text: &str) -> Option<MultiTargetSpec> {
     Some(MultiTargetSpec::fixed(count, count))
 }
 
+fn extract_deal_damage_multi_target(text: &str) -> Option<MultiTargetSpec> {
+    let lower = text.to_lowercase();
+    let after_each_of = strip_after(&lower, "damage to each of ")?;
+    let (_, multi_target) = strip_optional_target_prefix(after_each_of);
+    multi_target
+}
+
+fn parse_each_of_up_to_damage_target<'a>(
+    target_phrase: &'a str,
+    ctx: &mut ParseContext,
+) -> Option<(TargetFilter, &'a str)> {
+    let lower = target_phrase.to_lowercase();
+    let (after_each_of_lower, _) = tag::<_, _, OracleError<'_>>("each of ")
+        .parse(lower.as_str())
+        .ok()?;
+    let consumed = lower.len() - after_each_of_lower.len();
+    let after_each_of = &target_phrase[consumed..];
+    let (target_text, multi_target) = strip_optional_target_prefix(after_each_of);
+    multi_target.as_ref()?;
+    let (target, remainder) = parse_target_with_ctx(target_text, ctx);
+    Some(refine_damage_target_remainder(target, remainder))
+}
+
 /// Verbs where "any number of" / "up to N" modifies the target set (CR 115.1d),
 /// not a resource count (counters, life, etc.).
 ///
@@ -14870,6 +14896,18 @@ fn try_parse_damage_with_remainder<'a>(
                     .parse(target_phrase)
                     .is_ok()
                 {
+                    if let Some((target, remainder)) =
+                        parse_each_of_up_to_damage_target(target_phrase, ctx)
+                    {
+                        return Some((
+                            Effect::DealDamage {
+                                amount: qty,
+                                target,
+                                damage_source: None,
+                            },
+                            remainder,
+                        ));
+                    }
                     // "each player" → DamageEachPlayer (per-player varying damage)
                     // "each creature" → DamageAll (uniform damage to objects)
                     // "each foe" — archaic synonym for opponent (friend/foe cards)
@@ -15009,6 +15047,18 @@ fn try_parse_damage_with_remainder<'a>(
         .parse(after_to_for_classification)
         .is_ok()
     {
+        if let Some((target, rem)) =
+            parse_each_of_up_to_damage_target(after_to_for_classification, ctx)
+        {
+            return Some((
+                Effect::DealDamage {
+                    amount: amount.clone(),
+                    target,
+                    damage_source: None,
+                },
+                rem,
+            ));
+        }
         if let Some(player_filter) = parse_damage_each_player_scope(after_to_for_classification) {
             return Some((
                 Effect::DamageEachPlayer {
@@ -22124,6 +22174,33 @@ mod tests {
             ),
             "Expected targeted PutCounter with multi_target, got {:?}",
             clause.effect
+        );
+    }
+
+    #[test]
+    fn deal_damage_each_of_up_to_two_target_creatures_is_multi_targeted() {
+        let clause = parse_effect_clause(
+            "~ deals 6 damage to each of up to two target creatures and/or planeswalkers",
+            &mut ParseContext::default(),
+        );
+        assert_eq!(clause.multi_target, Some(MultiTargetSpec::fixed(0, 2)));
+        let Effect::DealDamage {
+            amount: QuantityExpr::Fixed { value: 6 },
+            target: TargetFilter::Or { filters },
+            damage_source: None,
+        } = clause.effect
+        else {
+            panic!(
+                "Expected targeted DealDamage with multi_target, got {:?}",
+                clause.effect
+            );
+        };
+        assert_eq!(
+            filters,
+            vec![
+                TargetFilter::Typed(TypedFilter::creature()),
+                TargetFilter::Typed(TypedFilter::new(TypeFilter::Planeswalker)),
+            ]
         );
     }
 
