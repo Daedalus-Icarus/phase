@@ -1140,6 +1140,41 @@ fn parse_hand_size_predicate(rest: &str, player: PlayerScope) -> Option<(&str, S
         ));
     }
 
+    // CR 402: "fewer than N cards in hand" → HandSize LT N
+    // "fewer than" is a strict inequality (e.g. "fewer than seven" excludes seven),
+    // used by Kozilek, the Great Distortion and Iymrith, Desert Doom.
+    if let Ok((after_n, n)) =
+        nom::sequence::preceded(tag::<_, _, OracleError<'_>>("fewer than "), parse_number)
+            .parse(rest)
+    {
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(" cards in hand").parse(after_n) {
+            return Some((
+                rest,
+                make_quantity_comparison(QuantityRef::HandSize { player }, Comparator::LT, n),
+            ));
+        }
+    }
+
+    // CR 402: "more cards in hand than you" → HandSize(player) GT HandSize(Controller)
+    // Used in cross-player comparisons like "that player has more cards in hand than you"
+    // (Slithermuse, Sandstone Oracle, Balance of Power).
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("more cards in hand than you").parse(rest) {
+        return Some((
+            rest,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::HandSize { player },
+                },
+                comparator: Comparator::GT,
+                rhs: QuantityExpr::Ref {
+                    qty: QuantityRef::HandSize {
+                        player: PlayerScope::Controller,
+                    },
+                },
+            },
+        ));
+    }
+
     // "N or more cards in hand" → HandSize GE N
     let (after_n, n) = parse_number(rest).ok()?;
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(" or more cards in hand").parse(after_n) {
@@ -1546,13 +1581,25 @@ fn parse_you_have_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
 /// patterns; life-total / graveyard variants will compose in here as more
 /// cards exercise them.
 fn parse_that_player_has_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = alt((
-        tag::<_, _, OracleError<'_>>("that player has "),
-        tag::<_, _, OracleError<'_>>("that opponent has "),
+    // CR 115.1 + CR 603.4: "that/target player/opponent has" decomposes the
+    // reference axis ("that" vs. "target") from the subject noun
+    // ("player" vs. "opponent"). "That" binds to the scoped event/iteration
+    // player; "target" binds to the first player target of the ability.
+    let (rest, player) = alt((
+        value(
+            PlayerScope::ScopedPlayer,
+            tag::<_, _, OracleError<'_>>("that "),
+        ),
+        value(PlayerScope::Target, tag::<_, _, OracleError<'_>>("target ")),
     ))
     .parse(input)?;
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("player has "),
+        tag::<_, _, OracleError<'_>>("opponent has "),
+    ))
+    .parse(rest)?;
 
-    if let Some((rest, cond)) = parse_hand_size_predicate(rest, PlayerScope::ScopedPlayer) {
+    if let Some((rest, cond)) = parse_hand_size_predicate(rest, player) {
         return Ok((rest, cond));
     }
     Err(nom::Err::Error(nom::error::Error::new(
@@ -4919,6 +4966,105 @@ mod tests {
                 assert_eq!(rhs, QuantityExpr::Fixed { value: 1 });
             }
             other => panic!("expected QuantityComparison, got {other:?}"),
+        }
+    }
+
+    /// CR 402: "fewer than N cards in hand" — strict less-than hand-size gate.
+    /// Used by Kozilek, the Great Distortion ("fewer than seven") and Iymrith,
+    /// Desert Doom ("fewer than three") as the draw-difference condition.
+    #[test]
+    fn test_parse_condition_you_have_fewer_than_n_cards() {
+        let (rest, c) = parse_condition("if you have fewer than seven cards in hand").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs,
+                comparator,
+                rhs,
+            } => {
+                assert_eq!(
+                    lhs,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::HandSize {
+                            player: PlayerScope::Controller,
+                        },
+                    }
+                );
+                assert_eq!(comparator, Comparator::LT, "fewer than → strict LT");
+                assert_eq!(rhs, QuantityExpr::Fixed { value: 7 });
+            }
+            other => panic!("expected HandSize LT 7, got {other:?}"),
+        }
+    }
+
+    /// CR 402: "that player has more cards in hand than you" — cross-player GT
+    /// comparison. Used by Slithermuse and Sandstone Oracle.
+    #[test]
+    fn test_parse_condition_that_player_more_cards_than_you() {
+        let (rest, c) = parse_condition("if that player has more cards in hand than you").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs,
+                comparator,
+                rhs,
+            } => {
+                assert_eq!(
+                    lhs,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::HandSize {
+                            player: PlayerScope::ScopedPlayer,
+                        },
+                    }
+                );
+                assert_eq!(comparator, Comparator::GT);
+                assert_eq!(
+                    rhs,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::HandSize {
+                            player: PlayerScope::Controller,
+                        },
+                    }
+                );
+            }
+            other => {
+                panic!("expected HandSize(ScopedPlayer) GT HandSize(Controller), got {other:?}")
+            }
+        }
+    }
+
+    /// CR 402: "target opponent has more cards in hand than you" — Target-scoped
+    /// cross-player GT comparison. Used by Balance of Power.
+    #[test]
+    fn test_parse_condition_target_opponent_more_cards_than_you() {
+        let (rest, c) =
+            parse_condition("if target opponent has more cards in hand than you").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs,
+                comparator,
+                rhs,
+            } => {
+                assert_eq!(
+                    lhs,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::HandSize {
+                            player: PlayerScope::Target,
+                        },
+                    }
+                );
+                assert_eq!(comparator, Comparator::GT);
+                assert_eq!(
+                    rhs,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::HandSize {
+                            player: PlayerScope::Controller,
+                        },
+                    }
+                );
+            }
+            other => panic!("expected HandSize(Target) GT HandSize(Controller), got {other:?}"),
         }
     }
 
