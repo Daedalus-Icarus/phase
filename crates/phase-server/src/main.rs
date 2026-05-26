@@ -5,15 +5,15 @@ mod persistence;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
+use axum::Router;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::Router;
 use clap::Parser;
 use engine::ai_support::{
     auto_pass_recommended as engine_auto_pass, legal_actions_full as engine_legal_actions_full,
@@ -24,19 +24,19 @@ use engine::game::validate_name_deck_for_format;
 use engine::types::game_state::GameState;
 use engine::types::player::PlayerId;
 use http::HeaderValue;
-use lobby_broker::{check_build_commit, Broker, BrokerEnv, BuildCommitCheck, ConnState, Outbound};
+use lobby_broker::{Broker, BrokerEnv, BuildCommitCheck, ConnState, Outbound, check_build_commit};
 use seat_reducer::types::{DeckChoice, DeckResolver, ReducerCtx};
 use server_core::draft_session::DraftSessionManager;
 use server_core::lobby::RegisterGameRequest;
 use server_core::protocol::{
-    build_commit, ClientMessage, ServerMessage, ServerMode, PROTOCOL_VERSION,
+    ClientMessage, PROTOCOL_VERSION, ServerMessage, ServerMode, build_commit,
 };
 use server_core::resolve_deck;
 use server_core::session::{ActionResult, GameSession, SessionManager};
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info, info_span, warn, Instrument};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 type SharedState = Arc<Mutex<SessionManager>>;
 type SharedConnections =
@@ -1722,6 +1722,7 @@ impl DeckResolver for ServerDeckResolver<'_> {
             DeckChoice::Random => server_core::starter_decks::random_starter_deck(),
             DeckChoice::Named(name) => server_core::starter_decks::find_starter_deck(name)
                 .ok_or_else(|| format!("Starter deck not found: {name}"))?,
+            DeckChoice::DeckList(deck) => deck.as_ref().clone(),
         };
         server_core::resolve_deck(self.db, &deck)
     }
@@ -2504,16 +2505,25 @@ async fn handle_client_message(
                 if seat.seat_index == 0 || seat.seat_index >= pc {
                     continue;
                 }
-                let ai_deck_data = match &seat.deck_name {
-                    Some(name) if name.eq_ignore_ascii_case("random") => {
-                        server_core::starter_decks::random_starter_deck()
-                    }
-                    Some(name) => server_core::starter_decks::find_starter_deck(name)
-                        .unwrap_or_else(|| {
+                let ai_deck_data = match &seat.deck {
+                    Some(DeckChoice::DeckList(deck)) => deck.as_ref().clone(),
+                    Some(DeckChoice::Named(name)) => {
+                        server_core::starter_decks::find_starter_deck(name).unwrap_or_else(|| {
                             warn!(deck = %name, "unknown AI deck name, using random");
                             server_core::starter_decks::random_starter_deck()
-                        }),
-                    None => server_core::starter_decks::random_starter_deck(),
+                        })
+                    }
+                    Some(DeckChoice::Random) | None => match &seat.deck_name {
+                        Some(name) if name.eq_ignore_ascii_case("random") => {
+                            server_core::starter_decks::random_starter_deck()
+                        }
+                        Some(name) => server_core::starter_decks::find_starter_deck(name)
+                            .unwrap_or_else(|| {
+                                warn!(deck = %name, "unknown AI deck name, using random");
+                                server_core::starter_decks::random_starter_deck()
+                            }),
+                        None => server_core::starter_decks::random_starter_deck(),
+                    },
                 };
                 if let Some(ref fc) = format_config {
                     if let Err(reasons) = validate_name_deck_for_format(

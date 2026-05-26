@@ -5,6 +5,8 @@ import type { FormatConfig, FormatGroup, GameFormat, MatchType } from "../../ada
 import { FORMAT_REGISTRY } from "../../data/formatRegistry";
 import { FORMAT_DEFAULTS, useMultiplayerStore } from "../../stores/multiplayerStore";
 import type { AiSeatConfig, HostingSettings } from "../../stores/multiplayerStore";
+import { useAiDeckCatalog } from "../../services/aiDeckCatalog";
+import { expandParsedDeck } from "../../services/deckParser";
 import { MenuPanel } from "../menu/MenuShell";
 import { menuButtonClass } from "../menu/buttonStyles";
 
@@ -89,6 +91,14 @@ export function HostSetup({
   const [aiSeats, setAiSeats] = useState<AiSeatConfig[]>([]);
   const [startWhenFull, setStartWhenFull] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const effectiveMatchType = playerCount === 2 ? matchType : "Bo1";
+  const aiDeckCatalog = useAiDeckCatalog({
+    selectedFormat: formatConfig.format,
+    selectedMatchType: effectiveMatchType,
+  });
+  const defaultAiDeck = aiDeckCatalog.candidates[0]
+    ? { type: "DeckList" as const, data: expandParsedDeck(aiDeckCatalog.candidates[0].deck) }
+    : null;
 
   // Mirror the in-flight format to the store on every change so sibling
   // views (the deck picker shown when the user clicks "Change Deck" out
@@ -178,8 +188,11 @@ export function HostSetup({
         password: showPassword ? password : "",
         timerSeconds: null,
         formatConfig: finalConfig,
-        matchType: playerCount === 2 ? matchType : "Bo1",
-        aiSeats,
+        matchType: effectiveMatchType,
+        aiSeats: aiSeats.map((seat) => ({
+          ...seat,
+          ...(defaultAiDeck ? { deck: defaultAiDeck } : {}),
+        })),
         startWhenFull,
         roomName: resolvedRoomName,
       });
@@ -566,9 +579,9 @@ export function HostSetup({
           </button>
           <button
             type="submit"
-            disabled={hostDisabled || isSubmitting || hostingStatus !== "idle"}
+            disabled={hostDisabled || isSubmitting || hostingStatus !== "idle" || (aiSeats.length > 0 && !defaultAiDeck)}
             title={hostDisabled ? hostDisabledReason : undefined}
-            aria-disabled={hostDisabled || isSubmitting || hostingStatus !== "idle" || undefined}
+            aria-disabled={hostDisabled || isSubmitting || hostingStatus !== "idle" || (aiSeats.length > 0 && !defaultAiDeck) || undefined}
             className={`${menuButtonClass({ tone: accentTone, size: "md" })} disabled:cursor-not-allowed disabled:opacity-50`}
           >
             {isSubmitting || hostingStatus !== "idle"

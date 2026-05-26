@@ -9,11 +9,11 @@ use engine::ai_support::{auto_pass_recommended, legal_actions_for_viewer, legal_
 use engine::database::{CardDatabase, CardSearchQuery};
 use engine::game::engine::apply;
 use engine::game::{
-    estimate_bracket, evaluate_deck_compatibility, filter_state_for_viewer, finalize_public_state,
+    BracketEstimate, DeckCompatibilityRequest, DeckList, PlayerDeckList, estimate_bracket,
+    evaluate_deck_compatibility, filter_state_for_viewer, finalize_public_state,
     is_brawl_commander_eligible, is_commander_eligible, is_tiny_leader_eligible,
     load_and_hydrate_decks, rehydrate_game_from_card_db, resolve_deck_list, start_game,
-    start_game_with_starting_player, validate_name_deck_for_format, BracketEstimate,
-    DeckCompatibilityRequest, DeckList, PlayerDeckList,
+    start_game_with_starting_player, validate_name_deck_for_format,
 };
 use engine::types::format::{FormatConfig, GameFormat};
 use engine::types::identifiers::ObjectId;
@@ -58,7 +58,7 @@ fn to_js<T: Serialize + ?Sized>(value: &T) -> JsValue {
 }
 
 use phase_ai::choose_action;
-use phase_ai::config::{create_config_for_players, AiDifficulty, Platform};
+use phase_ai::config::{AiDifficulty, Platform, create_config_for_players};
 thread_local! {
     /// Game state uses Cell<Option<T>> with take/set to avoid RefCell borrow poisoning.
     /// In WASM, panics don't unwind (no RAII cleanup), so a RefCell::borrow_mut() that
@@ -93,8 +93,7 @@ pub fn is_multiplayer_mode() -> bool {
 /// JS adapter code matches on this prefix to classify the failure as
 /// `AdapterErrorCode.STATE_LOST` and trigger transparent rehydrate-and-retry
 /// recovery. Keep the prefix exact — it is part of the adapter contract.
-const NOT_INITIALIZED_ERR: &str =
-    "NOT_INITIALIZED: Game state not initialized. Call initialize_game or restore_game_state first.";
+const NOT_INITIALIZED_ERR: &str = "NOT_INITIALIZED: Game state not initialized. Call initialize_game or restore_game_state first.";
 
 /// Take the game state out of the Cell, pass it to a closure that may mutate it,
 /// then put it back. If the closure panics, the state is lost (None) but subsequent
@@ -1277,6 +1276,7 @@ pub fn apply_seat_mutation(state_json: &str, mutation_json: &str) -> Result<JsVa
                 DeckChoice::Random => starter_decks::random_starter_deck(),
                 DeckChoice::Named(name) => starter_decks::find_starter_deck(name)
                     .ok_or_else(|| format!("Starter deck not found: {name}"))?,
+                DeckChoice::DeckList(deck) => deck.as_ref().clone(),
             };
             CARD_DB.with(|cell| {
                 let db = cell.borrow();
