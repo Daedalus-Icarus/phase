@@ -126,9 +126,7 @@ async function loadBuild(build: Build): Promise<BuildCache> {
     checkedAt: now,
   };
   caches.set(build, cache);
-  // stderr keeps the message visible in the card-bot's logs while leaving
-  // stdout clean for consumers that pipe JSON (e.g. classify-bug-coverage.ts).
-  console.error(`[coverage] loaded ${build}: ${cache.byName.size} cards`);
+  console.log(`[coverage] loaded ${build}: ${cache.byName.size} cards`);
   return cache;
 }
 
