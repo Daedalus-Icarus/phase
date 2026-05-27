@@ -4569,7 +4569,8 @@ fn parse_damage_prevention_replacement(
                 ),
             )
             .parse(input)
-        });
+        })
+        .or_else(|| parse_damage_recipient_valid_card_filter(working_lower));
 
     // --- 4. Extract damage source filter ---
     let damage_source_filter = parse_damage_source_filter(working_lower);
@@ -4632,6 +4633,49 @@ fn parse_damage_prevention_replacement(
     }
 
     Some(def)
+}
+
+fn parse_damage_recipient_valid_card_filter(working_lower: &str) -> Option<TargetFilter> {
+    nom_primitives::scan_at_word_boundaries(working_lower, |input| {
+        let (after_to, _) = tag::<_, _, OracleError<'_>>("dealt to ").parse(input)?;
+        let (filter, rest) = parse_type_phrase(after_to);
+        if matches!(filter, TargetFilter::Any) {
+            return Err(nom::Err::Error(OracleError::new(
+                after_to,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
+
+        let rest = rest.trim_start();
+        if all_consuming(alt((
+            value((), eof::<&str, OracleError<'_>>),
+            value((), tag::<_, _, OracleError<'_>>(".")),
+            value(
+                (),
+                terminated(
+                    tag::<_, _, OracleError<'_>>("this turn"),
+                    opt(tag::<_, _, OracleError<'_>>(".")),
+                ),
+            ),
+            value(
+                (),
+                terminated(
+                    tag::<_, _, OracleError<'_>>("until end of turn"),
+                    opt(tag::<_, _, OracleError<'_>>(".")),
+                ),
+            ),
+        )))
+        .parse(rest)
+        .is_ok()
+        {
+            Ok((rest, filter))
+        } else {
+            Err(nom::Err::Error(OracleError::new(
+                rest,
+                nom::error::ErrorKind::Verify,
+            )))
+        }
+    })
 }
 
 /// CR 615.5 + CR 609.7: Walk an `AbilityDefinition` tree and rewrite every
@@ -5796,6 +5840,28 @@ mod tests {
                 "expected attached-object scope for {text}"
             );
         }
+    }
+
+    #[test]
+    fn replacement_prevent_damage_to_attacking_artifact_creatures_you_control_scopes_recipient() {
+        let def = parse_replacement_line(
+            "Prevent all combat damage that would be dealt to attacking artifact creatures you control.",
+            "Losheel, Clockwork Scholar",
+        )
+        .unwrap();
+
+        assert_eq!(def.event, ReplacementEvent::DamageDone);
+        assert_eq!(def.combat_scope, Some(CombatDamageScope::CombatOnly));
+        assert_eq!(
+            def.valid_card,
+            Some(TargetFilter::Typed(
+                TypedFilter::new(TypeFilter::Artifact)
+                    .with_type(TypeFilter::Creature)
+                    .controller(ControllerRef::You)
+                    .properties(vec![FilterProp::Attacking])
+            ))
+        );
+        assert!(def.damage_target_filter.is_none());
     }
 
     #[test]
