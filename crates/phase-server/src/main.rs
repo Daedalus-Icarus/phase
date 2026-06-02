@@ -54,7 +54,8 @@ use server_core::resolve_deck;
 use server_core::seat_mutation_wire_guard::guard_seat_mutation;
 use server_core::session::{ActionResult, GameSession, SessionManager};
 use server_core::spectator_wire_guard::{
-    guard_game_spectator_capacity, guard_spectate_draft, guard_spectator_join,
+    guard_draft_spectator_capacity, guard_game_spectator_capacity, guard_spectate_draft,
+    guard_spectator_join,
 };
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
@@ -134,6 +135,59 @@ async fn switch_game_spectator_slot(
     if previous_game_code != Some(game_code) {
         if let Some(previous_game_code) = previous_game_code {
             remove_game_spectator_sender(game_spectators, previous_game_code, tx).await;
+        }
+    }
+    Ok(())
+}
+
+async fn remove_draft_spectator_sender(
+    draft_spectators: &SharedDraftSpectators,
+    draft_code: &str,
+    tx: &mpsc::UnboundedSender<ServerMessage>,
+) {
+    let mut specs = draft_spectators.lock().await;
+    if let Some(spectators) = specs.get_mut(draft_code) {
+        spectators.retain(|(_, sender)| !sender.same_channel(tx) && !sender.is_closed());
+        if spectators.is_empty() {
+            specs.remove(draft_code);
+        }
+    }
+}
+
+async fn reserve_draft_spectator_slot(
+    draft_spectators: &SharedDraftSpectators,
+    draft_code: &str,
+    visibility: draft_core::types::SpectatorVisibility,
+    tx: &mpsc::UnboundedSender<ServerMessage>,
+) -> Result<(), String> {
+    let mut specs = draft_spectators.lock().await;
+    let spectators = specs.entry(draft_code.to_string()).or_default();
+    spectators.retain(|(_, sender)| !sender.is_closed());
+
+    if let Some((existing_visibility, _)) = spectators
+        .iter_mut()
+        .find(|(_, sender)| sender.same_channel(tx))
+    {
+        *existing_visibility = visibility;
+        return Ok(());
+    }
+
+    guard_draft_spectator_capacity(spectators.len())?;
+    spectators.push((visibility, tx.clone()));
+    Ok(())
+}
+
+async fn switch_draft_spectator_slot(
+    draft_spectators: &SharedDraftSpectators,
+    previous_draft_code: Option<&str>,
+    draft_code: &str,
+    visibility: draft_core::types::SpectatorVisibility,
+    tx: &mpsc::UnboundedSender<ServerMessage>,
+) -> Result<(), String> {
+    reserve_draft_spectator_slot(draft_spectators, draft_code, visibility, tx).await?;
+    if previous_draft_code != Some(draft_code) {
+        if let Some(previous_draft_code) = previous_draft_code {
+            remove_draft_spectator_sender(draft_spectators, previous_draft_code, tx).await;
         }
     }
     Ok(())
@@ -1293,6 +1347,9 @@ async fn handle_socket(
 
     if let Some(game_code) = &identity.spectator_game_code {
         remove_game_spectator_sender(&game_spectators, game_code, &tx).await;
+    }
+    if let Some(draft_code) = &identity.spectator_draft_code {
+        remove_draft_spectator_sender(&draft_spectators, draft_code, &tx).await;
     }
 
     if !identity.seat_reservations.is_empty() {
@@ -4833,35 +4890,73 @@ async fn handle_client_message(
                 return;
             }
 
-            let drafts = draft_state.lock().await;
-            if let Some(session) = drafts.sessions.get(&draft_code) {
-                // Derive visibility from session config (host-configured, per D-07)
-                let visibility = session.config.spectator_visibility;
-                let view = draft_core::view::filter_for_spectator(&session.session, visibility);
-                // Record spectator identity (T-60-09: prevents spectator from sending DraftAction)
-                identity.spectator_draft_code = Some(draft_code.clone());
-                identity.spectator_visibility = Some(visibility);
-                // Register spectator sender for live broadcasts
-                {
-                    let mut specs = draft_spectators.lock().await;
-                    specs
-                        .entry(draft_code.clone())
-                        .or_default()
-                        .push((visibility, tx.clone()));
+            let visibility = {
+                let drafts = draft_state.lock().await;
+                match drafts.sessions.get(&draft_code) {
+                    Some(session) => session.config.spectator_visibility,
+                    None => {
+                        let msg = ServerMessage::Error {
+                            message: "Draft not found".to_string(),
+                        };
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            let _ = socket.send(Message::text(json)).await;
+                        }
+                        return;
+                    }
                 }
-                let msg = ServerMessage::DraftSpectatorView { view };
+            };
+
+            if let Err(reason) = switch_draft_spectator_slot(
+                draft_spectators,
+                identity.spectator_draft_code.as_deref(),
+                &draft_code,
+                visibility,
+                tx,
+            )
+            .await
+            {
+                let msg = ServerMessage::Error { message: reason };
                 if let Ok(json) = serde_json::to_string(&msg) {
                     let _ = socket.send(Message::text(json)).await;
                 }
-                info!(draft = %draft_code, ?visibility, "spectator connected to draft");
-            } else {
-                let msg = ServerMessage::Error {
-                    message: "Draft not found".to_string(),
-                };
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    let _ = socket.send(Message::text(json)).await;
+                return;
+            }
+
+            let snapshot_result = {
+                let drafts = draft_state.lock().await;
+                match drafts.sessions.get(&draft_code) {
+                    Some(session) => {
+                        let visibility = session.config.spectator_visibility;
+                        let view =
+                            draft_core::view::filter_for_spectator(&session.session, visibility);
+                        Ok((visibility, view))
+                    }
+                    None => Err("Draft not found".to_string()),
+                }
+            };
+
+            let (visibility, view) = match snapshot_result {
+                Ok(snapshot) => snapshot,
+                Err(message) => {
+                    remove_draft_spectator_sender(draft_spectators, &draft_code, tx).await;
+                    let msg = ServerMessage::Error { message };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        let _ = socket.send(Message::text(json)).await;
+                    }
+                    return;
+                }
+            };
+
+            let msg = ServerMessage::DraftSpectatorView { view };
+            if let Ok(json) = serde_json::to_string(&msg) {
+                if socket.send(Message::text(json)).await.is_err() {
+                    remove_draft_spectator_sender(draft_spectators, &draft_code, tx).await;
+                    return;
                 }
             }
+            identity.spectator_draft_code = Some(draft_code.clone());
+            identity.spectator_visibility = Some(visibility);
+            info!(draft = %draft_code, ?visibility, "spectator connected to draft");
         }
 
         ClientMessage::UnregisterLobby { .. } => {
@@ -4941,7 +5036,9 @@ mod ranked_tests {
 #[cfg(test)]
 mod live_spectator_tests {
     use super::*;
-    use server_core::spectator_wire_guard::MAX_GAME_SPECTATORS_PER_GAME;
+    use server_core::spectator_wire_guard::{
+        MAX_DRAFT_SPECTATORS_PER_DRAFT, MAX_GAME_SPECTATORS_PER_GAME,
+    };
 
     #[test]
     fn spectator_state_update_keeps_public_status_without_actions() {
@@ -5062,6 +5159,72 @@ mod live_spectator_tests {
             specs.get("FULL").map(Vec::len),
             Some(MAX_GAME_SPECTATORS_PER_GAME)
         );
+    }
+
+    #[tokio::test]
+    async fn draft_spectator_reservation_rejects_when_draft_is_at_cap() {
+        let spectators: SharedDraftSpectators = Arc::new(Mutex::new(HashMap::new()));
+        let visibility = draft_core::types::SpectatorVisibility::default();
+        let mut receivers = Vec::new();
+        {
+            let mut specs = spectators.lock().await;
+            let draft_spectators = specs.entry("FULL".to_string()).or_default();
+            for _ in 0..MAX_DRAFT_SPECTATORS_PER_DRAFT {
+                let (tx, rx) = mpsc::unbounded_channel();
+                draft_spectators.push((visibility, tx));
+                receivers.push(rx);
+            }
+        }
+        let (overflow_tx, _overflow_rx) = mpsc::unbounded_channel();
+
+        let err = reserve_draft_spectator_slot(&spectators, "FULL", visibility, &overflow_tx)
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("maximum"));
+        assert_eq!(
+            spectators.lock().await.get("FULL").map(Vec::len),
+            Some(MAX_DRAFT_SPECTATORS_PER_DRAFT)
+        );
+        drop(receivers);
+    }
+
+    #[tokio::test]
+    async fn draft_spectator_reservation_prunes_closed_senders_before_cap_check() {
+        let spectators: SharedDraftSpectators = Arc::new(Mutex::new(HashMap::new()));
+        let visibility = draft_core::types::SpectatorVisibility::default();
+        {
+            let mut specs = spectators.lock().await;
+            let draft_spectators = specs.entry("PRUNE".to_string()).or_default();
+            for _ in 0..MAX_DRAFT_SPECTATORS_PER_DRAFT {
+                let (tx, rx) = mpsc::unbounded_channel();
+                drop(rx);
+                draft_spectators.push((visibility, tx));
+            }
+        }
+        let (new_tx, _new_rx) = mpsc::unbounded_channel();
+
+        reserve_draft_spectator_slot(&spectators, "PRUNE", visibility, &new_tx)
+            .await
+            .expect("closed senders should be pruned before enforcing cap");
+
+        assert_eq!(spectators.lock().await.get("PRUNE").map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn draft_spectator_reservation_is_idempotent_for_same_channel() {
+        let spectators: SharedDraftSpectators = Arc::new(Mutex::new(HashMap::new()));
+        let visibility = draft_core::types::SpectatorVisibility::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        reserve_draft_spectator_slot(&spectators, "SAME", visibility, &tx)
+            .await
+            .unwrap();
+        reserve_draft_spectator_slot(&spectators, "SAME", visibility, &tx)
+            .await
+            .unwrap();
+
+        assert_eq!(spectators.lock().await.get("SAME").map(Vec::len), Some(1));
     }
 }
 
