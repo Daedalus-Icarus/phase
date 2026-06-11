@@ -4624,6 +4624,17 @@ fn resolve_chain_body(
     // This allows sub-abilities like "its controller gains life" to access the object
     // targeted by the parent (e.g. the exiled creature in Swords to Plowshares).
     if let Some(ref sub) = ability.sub_ability {
+        // CR 614.1a + CR 608.2c: CastFromZone consumes the Toshiro/Gearhulk
+        // exile-instead rider by stamping the granted casting permission. Do
+        // not also execute the parser's structural `ChangeZone { ParentTarget }`
+        // rider as an immediate move, or the graveyard card leaves before the
+        // player can cast it.
+        if matches!(&ability.effect, Effect::CastFromZone { .. })
+            && cast_from_zone::is_graveyard_exile_rider_subability(sub)
+        {
+            return Ok(());
+        }
+
         // Check if the sub_ability has a condition that gates its execution.
         // Casting-time conditions are evaluated against the parent's SpellContext.
         if let Some(ref condition) = sub.condition {
@@ -9527,6 +9538,8 @@ mod tests {
                         granted_to: None,
                         resolution_cleanup: None,
                         duration: None,
+
+                        exile_instead_of_graveyard_on_resolve: false,
                     },
                     target: TargetFilter::TrackedSet {
                         id: TrackedSetId(0),
@@ -9618,6 +9631,8 @@ mod tests {
                         granted_to: None,
                         resolution_cleanup: None,
                         duration: None,
+
+                        exile_instead_of_graveyard_on_resolve: false,
                     },
                     target: TargetFilter::TrackedSet {
                         id: TrackedSetId(0),
@@ -9683,6 +9698,8 @@ mod tests {
                     granted_to: None,
                     resolution_cleanup: None,
                     duration: None,
+
+                    exile_instead_of_graveyard_on_resolve: false,
                 },
                 target: TargetFilter::TrackedSet {
                     id: TrackedSetId(0),
