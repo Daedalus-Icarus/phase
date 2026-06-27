@@ -2447,6 +2447,50 @@ fn chandras_incinerator_self_cost_reduction_uses_noncombat_damage_to_opponents()
     );
 }
 
+#[test]
+fn visions_of_ruin_cast_this_way_cost_reduction_binds_commander_mv() {
+    let def = parse_flashback_trailing_self_spell_cost_reduction(
+        "This spell costs {X} less to cast this way, where X is the greatest mana value of a commander you own on the battlefield or in the command zone.",
+    )
+    .unwrap();
+
+    let StaticMode::ModifyCost {
+        mode: CostModifyMode::Reduce,
+        dynamic_count:
+            Some(QuantityRef::Aggregate {
+                function: AggregateFunction::Max,
+                property: ObjectProperty::ManaValue,
+                ..
+            }),
+        ..
+    } = def.mode
+    else {
+        panic!(
+            "expected commander-MV dynamic ReduceCost, got {:?}",
+            def.mode
+        );
+    };
+    assert!(matches!(
+        def.condition,
+        Some(StaticCondition::CastingAsVariant {
+            variant: crate::types::game_state::CastingVariant::Flashback
+        })
+    ));
+    assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
+}
+
+#[test]
+fn cast_this_way_cost_reduction_without_flashback_context_has_no_variant_gate() {
+    let def = parse_static_line(
+        "This spell costs {X} less to cast this way, where X is the greatest mana value of a commander you own on the battlefield or in the command zone.",
+    )
+    .unwrap();
+    assert!(!matches!(
+        def.condition,
+        Some(StaticCondition::CastingAsVariant { .. })
+    ));
+}
+
 /// CR 601.2f + CR 102.2/102.3: Heliod, the Warped Eclipse. "Spells you cast cost
 /// {1} less to cast for each card your opponents have drawn this turn." must lower
 /// to a `ModifyCost { mode: Reduce, dynamic_count: CardsDrawnThisTurn{Opponent{Sum}} }`.

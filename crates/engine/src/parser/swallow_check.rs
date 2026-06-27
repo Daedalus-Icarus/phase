@@ -2895,6 +2895,7 @@ mod tests {
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
     use crate::types::ability::{AbilityDefinition, Effect, OutsideGameSourcePool, TargetFilter};
     use crate::types::identifiers::TrackedSetId;
+    use crate::types::keywords::Keyword;
     use crate::types::mana::ManaCost;
     use crate::types::statics::StaticMode;
     use crate::types::zones::Zone;
@@ -4157,6 +4158,47 @@ mod tests {
                 .iter()
                 .all(|warning| { !matches!(warning, OracleDiagnostic::SwallowedClause { .. }) }),
             "Progenitor's Icon must not trigger swallowed clause warnings: {:?}",
+            parsed.parse_warnings
+        );
+    }
+
+    /// CR 702.34a + CR 601.2f: Visions of Ruin — flashback cost plus commander-MV
+    /// "cast this way" reduction must parse without swallowing either clause.
+    #[test]
+    fn visions_of_ruin_flashback_commander_reduction_parses_without_swallow() {
+        let parsed = parse_named(
+            "Each opponent sacrifices an artifact. For each artifact sacrificed this way, you create a Treasure token.\n\
+             Flashback {8}{R}{R}. This spell costs {X} less to cast this way, where X is the greatest mana value of a commander you own on the battlefield or in the command zone.",
+            "Visions of Ruin",
+            &["Sorcery"],
+        );
+        assert!(
+            parsed
+                .extracted_keywords
+                .iter()
+                .any(|k| matches!(k, Keyword::Flashback(_))),
+            "expected Flashback keyword, got {:?}",
+            parsed.extracted_keywords
+        );
+        assert!(
+            parsed.statics.iter().any(|sd| {
+                matches!(sd.mode, StaticMode::ModifyCost { .. })
+                    && sd.condition.as_ref().is_some_and(|cond| {
+                        matches!(
+                            cond,
+                            crate::types::ability::StaticCondition::CastingAsVariant { .. }
+                        )
+                    })
+            }),
+            "expected flashback-gated ReduceCost static, got {:?}",
+            parsed.statics
+        );
+        assert!(
+            parsed
+                .parse_warnings
+                .iter()
+                .all(|warning| !matches!(warning, OracleDiagnostic::SwallowedClause { .. })),
+            "Visions of Ruin must not swallow flashback cost-reduction clauses: {:?}",
             parsed.parse_warnings
         );
     }
