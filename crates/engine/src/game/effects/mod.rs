@@ -1063,7 +1063,7 @@ pub(crate) fn prepend_remaining_pay_cost_continuation(
         if sub_clone.targets.is_empty() && !ability.targets.is_empty() {
             sub_clone.targets = ability.targets.clone();
         }
-        apply_parent_chain_context(&mut sub_clone, ability, None);
+        apply_parent_chain_context(&mut sub_clone, ability, None, state);
         super::ability_utils::append_to_sub_chain(&mut remaining_payment, sub_clone);
     }
 
@@ -1448,7 +1448,7 @@ fn try_begin_reflexive_target_selection(
     if reflexive.modal.is_some() && !reflexive.mode_abilities.is_empty() {
         let mut reflexive_clone = reflexive.clone();
         if let Some(parent) = parent {
-            apply_parent_chain_context(&mut reflexive_clone, parent, effect_context_object);
+            apply_parent_chain_context(&mut reflexive_clone, parent, effect_context_object, state);
         }
         let trigger_description = reflexive_clone
             .description
@@ -1523,7 +1523,7 @@ fn try_begin_reflexive_target_selection(
         .map_err(|e| EffectError::InvalidParam(e.to_string()))?;
         let mut reflexive_clone = reflexive.clone();
         if let Some(parent) = parent {
-            apply_parent_chain_context(&mut reflexive_clone, parent, effect_context_object);
+            apply_parent_chain_context(&mut reflexive_clone, parent, effect_context_object, state);
         }
         crate::game::ability_utils::assign_targets_in_chain(state, &mut reflexive_clone, &chosen)
             .map_err(|e| EffectError::InvalidParam(e.to_string()))?;
@@ -1541,7 +1541,7 @@ fn try_begin_reflexive_target_selection(
 
     let mut reflexive_clone = reflexive.clone();
     if let Some(parent) = parent {
-        apply_parent_chain_context(&mut reflexive_clone, parent, effect_context_object);
+        apply_parent_chain_context(&mut reflexive_clone, parent, effect_context_object, state);
     }
     let trigger_description = reflexive_clone
         .description
@@ -1660,8 +1660,22 @@ fn apply_parent_chain_context(
     child: &mut ResolvedAbility,
     parent: &ResolvedAbility,
     effect_context_object: Option<&CostPaidObjectSnapshot>,
+    state: &mut GameState,
 ) {
     child.context = parent.context.clone();
+    // CR 401.5 + CR 608.2c (issue #1365): `state.last_dig_found_nothing` is
+    // true for the narrow window between a `Dig` resolving an empty library
+    // and the very next parent->child hand-off — this IS that hand-off, so
+    // stamp the typed, per-ability signal onto `child` and consume the
+    // transient global flag immediately. Consuming here (rather than where
+    // `child` is later resolved) means the signal can never reach a second,
+    // unrelated hand-off later in the same resolution, and a child that was
+    // never handed off this way (e.g. a freshly-built ability in a test)
+    // simply keeps the default `false` regardless of stray global state.
+    if state.last_dig_found_nothing {
+        child.dig_found_nothing_for_parent_target = true;
+        state.last_dig_found_nothing = false;
+    }
     // CR 608.2c: A sub-ability is part of the same printed ability instance as
     // its parent; its instructions are followed in order during a single
     // resolution. Propagate the parent's `ability_index` so chain-level
@@ -4914,6 +4928,13 @@ pub fn resolve_ability_chain(
     // across unrelated ability resolutions.
     if depth == 0 {
         state.last_revealed_ids.clear();
+        // CR 401.5 + CR 608.2c: Defense in depth — `apply_parent_chain_context`
+        // already consumes this at the very next parent->child hand-off after a
+        // Dig sets it, but a Dig with no sub_ability at all would otherwise leave
+        // it dangling true until some unrelated LATER resolution's first hand-off
+        // (e.g. Avenging Angel's LTB self-return). Reset at every fresh
+        // resolution so that can never happen.
+        state.last_dig_found_nothing = false;
         // CR 701.20e: A new top-level resolution ends any prior private "look at"
         // peek window — the looked-at card from an unrelated resolution must not
         // stay visible. Cleared here (depth 0 only) so a resumed optional-reveal
@@ -5309,7 +5330,7 @@ fn resolve_chain_body(
         if let Some(ref next) = ability.sub_ability {
             if next.sub_link == SubAbilityLink::SequentialSibling {
                 let mut sibling = next.as_ref().clone();
-                apply_parent_chain_context(&mut sibling, ability, None);
+                apply_parent_chain_context(&mut sibling, ability, None, state);
                 resolve_ability_chain(state, &sibling, events, depth + 1)?;
             }
         }
@@ -6513,6 +6534,7 @@ fn resolve_chain_body(
                         &mut resolved,
                         ability,
                         effect_context_object.as_ref(),
+                        state,
                     );
                     if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
                         debug_assert!(
@@ -6541,6 +6563,7 @@ fn resolve_chain_body(
                         &mut resolved,
                         ability,
                         effect_context_object.as_ref(),
+                        state,
                     );
                     // If the parent effect entered an interactive state (e.g.,
                     // SearchChoice), stash the else chain as a continuation so it
@@ -6596,7 +6619,12 @@ fn resolve_chain_body(
                 if sub_clone.targets.is_empty() && !ability.targets.is_empty() {
                     sub_clone.targets = ability.targets.clone();
                 }
-                apply_parent_chain_context(&mut sub_clone, ability, effect_context_object.as_ref());
+                apply_parent_chain_context(
+                    &mut sub_clone,
+                    ability,
+                    effect_context_object.as_ref(),
+                    state,
+                );
                 prepend_to_pending_continuation(state, sub_clone);
                 return Ok(());
             }
@@ -6650,6 +6678,7 @@ fn resolve_chain_body(
                         &mut else_resolved,
                         ability,
                         effect_context_object.as_ref(),
+                        state,
                     );
                     if try_begin_deferred_else_branch_target_selection(
                         state,
@@ -6685,6 +6714,7 @@ fn resolve_chain_body(
                                 &mut sibling_resolved,
                                 ability,
                                 effect_context_object.as_ref(),
+                                state,
                             );
                             if sibling_resolved
                                 .condition
@@ -6798,7 +6828,12 @@ fn resolve_chain_body(
             if sub_clone.targets.is_empty() && !ability.targets.is_empty() {
                 sub_clone.targets = ability.targets.clone();
             }
-            apply_parent_chain_context(&mut sub_clone, ability, effect_context_object.as_ref());
+            apply_parent_chain_context(
+                &mut sub_clone,
+                ability,
+                effect_context_object.as_ref(),
+                state,
+            );
             prepend_to_pending_continuation(state, sub_clone);
             return Ok(());
         }
@@ -6826,6 +6861,7 @@ fn resolve_chain_body(
                         &mut sub_with_source,
                         ability,
                         effect_context_object.as_ref(),
+                        state,
                     );
                     resolve_ability_chain(state, &sub_with_source, events, depth + 1)?;
                     return Ok(());
@@ -6862,6 +6898,7 @@ fn resolve_chain_body(
                     &mut sub_with_sources,
                     ability,
                     effect_context_object.as_ref(),
+                    state,
                 );
                 resolve_ability_chain(state, &sub_with_sources, events, depth + 1)?;
                 return Ok(());
@@ -6938,6 +6975,7 @@ fn resolve_chain_body(
                 &mut sub_with_context,
                 ability,
                 effect_context_object.as_ref(),
+                state,
             );
             resolve_ability_chain(state, &sub_with_context, events, depth + 1)?;
         } else if sub.targets.is_empty()
@@ -6960,6 +6998,7 @@ fn resolve_chain_body(
                 &mut sub_with_targets,
                 ability,
                 effect_context_object.as_ref(),
+                state,
             );
             resolve_ability_chain(state, &sub_with_targets, events, depth + 1)?;
         } else if sub.targets.is_empty()
@@ -6981,6 +7020,7 @@ fn resolve_chain_body(
                 &mut sub_with_targets,
                 ability,
                 effect_context_object.as_ref(),
+                state,
             );
             resolve_ability_chain(state, &sub_with_targets, events, depth + 1)?;
         } else if sub.targets.is_empty()
@@ -7004,6 +7044,7 @@ fn resolve_chain_body(
                 &mut sub_with_targets,
                 ability,
                 effect_context_object.as_ref(),
+                state,
             );
             resolve_ability_chain(state, &sub_with_targets, events, depth + 1)?;
         } else if sub.targets.is_empty() && effect_uses_implicit_tracked_set_targets(&sub.effect) {
@@ -7012,6 +7053,7 @@ fn resolve_chain_body(
                 &mut sub_with_context,
                 ability,
                 effect_context_object.as_ref(),
+                state,
             );
             resolve_ability_chain(state, &sub_with_context, events, depth + 1)?;
         } else if sub.targets.is_empty() && !ability.targets.is_empty() {
@@ -7021,6 +7063,7 @@ fn resolve_chain_body(
                 &mut sub_with_targets,
                 ability,
                 effect_context_object.as_ref(),
+                state,
             );
             resolve_ability_chain(state, &sub_with_targets, events, depth + 1)?;
         } else if sub.targets.is_empty()
@@ -7043,6 +7086,7 @@ fn resolve_chain_body(
                 &mut sub_with_referent,
                 ability,
                 effect_context_object.as_ref(),
+                state,
             );
             resolve_ability_chain(state, &sub_with_referent, events, depth + 1)?;
         } else {
@@ -7054,6 +7098,7 @@ fn resolve_chain_body(
                 &mut sub_with_context,
                 ability,
                 effect_context_object.as_ref(),
+                state,
             );
             resolve_ability_chain(state, &sub_with_context, events, depth + 1)?;
         }
