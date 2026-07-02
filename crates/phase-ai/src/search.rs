@@ -2224,6 +2224,7 @@ pub(crate) fn deterministic_choice(
     if let WaitingFor::DeclareAttackers {
         valid_attacker_ids,
         valid_attack_targets,
+        valid_attack_targets_by_attacker,
         ..
     } = &state.waiting_for
     {
@@ -2234,6 +2235,7 @@ pub(crate) fn deterministic_choice(
             config.combat_lookahead,
             Some(valid_attacker_ids),
             Some(valid_attack_targets),
+            Some(valid_attack_targets_by_attacker),
         );
         return Some(validated_declare_attackers(state, attacks));
     }
@@ -2283,6 +2285,7 @@ fn deterministic_combat_choice(
     if let WaitingFor::DeclareAttackers {
         valid_attacker_ids,
         valid_attack_targets,
+        valid_attack_targets_by_attacker,
         ..
     } = &state.waiting_for
     {
@@ -2293,6 +2296,7 @@ fn deterministic_combat_choice(
             false,
             Some(valid_attacker_ids),
             Some(valid_attack_targets),
+            Some(valid_attack_targets_by_attacker),
         );
         return Some(validated_declare_attackers(state, attacks));
     }
@@ -3658,6 +3662,7 @@ mod tests {
             player: PlayerId(0),
             valid_attacker_ids: vec![creature],
             valid_attack_targets: vec![],
+            valid_attack_targets_by_attacker: std::collections::HashMap::new(),
         };
 
         let config = create_config(AiDifficulty::VeryHard, Platform::Native);
@@ -3690,6 +3695,7 @@ mod tests {
             player: PlayerId(0),
             valid_attacker_ids: vec![creature],
             valid_attack_targets: vec![target],
+            valid_attack_targets_by_attacker: std::collections::HashMap::new(),
         };
 
         let action = validated_declare_attackers(&state, vec![(creature, target)]);
@@ -3699,6 +3705,45 @@ mod tests {
                 !attacks.iter().any(|(id, _)| *id == creature),
                 "guard must drop the illegal (tapped) attacker, got {attacks:?}"
             ),
+            other => panic!("expected DeclareAttackers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declare_attackers_uses_per_attacker_target_map() {
+        let mut state = GameState::new(engine::types::format::FormatConfig::standard(), 3, 42);
+        state.turn_number = 2;
+        state.phase = Phase::DeclareAttackers;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        let attacker = add_creature(&mut state, PlayerId(0), 3, 3);
+        state.players[1].life = 2;
+        state.players[2].life = 20;
+        let p1 = engine::game::combat::AttackTarget::Player(PlayerId(1));
+        let p2 = engine::game::combat::AttackTarget::Player(PlayerId(2));
+
+        state.waiting_for = WaitingFor::DeclareAttackers {
+            player: PlayerId(0),
+            valid_attacker_ids: vec![attacker],
+            valid_attack_targets: vec![p1, p2],
+            valid_attack_targets_by_attacker: std::collections::HashMap::from([(
+                attacker,
+                vec![p2],
+            )]),
+        };
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let mut rng = SmallRng::seed_from_u64(42);
+        let action = choose_action(&state, PlayerId(0), &config, &mut rng);
+
+        match action {
+            Some(GameAction::DeclareAttackers { attacks, .. }) => {
+                assert_eq!(
+                    attacks,
+                    vec![(attacker, p2)],
+                    "declare-attackers choice must respect the per-attacker legal target map"
+                );
+            }
             other => panic!("expected DeclareAttackers, got {other:?}"),
         }
     }

@@ -135,13 +135,17 @@ pub fn choose_attackers_with_targets(
     state: &GameState,
     player: PlayerId,
 ) -> Vec<(ObjectId, AttackTarget)> {
+    let valid_attack_targets = engine::game::combat::get_valid_attack_targets(state);
+    let valid_attack_targets_by_attacker =
+        engine::game::combat::get_valid_attack_targets_by_attacker(state);
     choose_attackers_with_targets_with_profile(
         state,
         player,
         &AiProfile::default(),
         false,
         None,
-        None,
+        Some(&valid_attack_targets),
+        Some(&valid_attack_targets_by_attacker),
     )
 }
 
@@ -152,6 +156,7 @@ pub fn choose_attackers_with_targets_with_profile(
     combat_lookahead: bool,
     valid_attacker_ids: Option<&[ObjectId]>,
     valid_attack_targets: Option<&[AttackTarget]>,
+    valid_attack_targets_by_attacker: Option<&HashMap<ObjectId, Vec<AttackTarget>>>,
 ) -> Vec<(ObjectId, AttackTarget)> {
     let opponents = players::opponents(state, player);
     if opponents.is_empty() {
@@ -162,6 +167,19 @@ pub fn choose_attackers_with_targets_with_profile(
     // local can_attack() for tests and hypothetical scenarios.
     let candidates: Vec<ObjectId> = if let Some(ids) = valid_attacker_ids {
         ids.to_vec()
+    } else if let Some(targets_by_attacker) = valid_attack_targets_by_attacker {
+        state
+            .battlefield
+            .iter()
+            .copied()
+            .filter(|id| {
+                targets_by_attacker.contains_key(id)
+                    && state
+                        .objects
+                        .get(id)
+                        .is_some_and(|obj| obj.controller == player)
+            })
+            .collect()
     } else {
         state
             .battlefield
@@ -419,6 +437,7 @@ pub fn choose_attackers_with_targets_with_profile(
             state,
             &attacking_ids,
             valid_attack_targets,
+            valid_attack_targets_by_attacker,
             objective,
             opp,
             opponent_life,
@@ -428,9 +447,55 @@ pub fn choose_attackers_with_targets_with_profile(
     }
 
     // Multi-opponent: assign attack targets (planeswalker redirect deferred).
-    let assignments = assign_attack_targets(state, player, &opponents, attacking_ids);
+    let assignments = assign_attack_targets(
+        state,
+        player,
+        &opponents,
+        attacking_ids,
+        valid_attack_targets,
+        valid_attack_targets_by_attacker,
+    );
     emit_attack_trace(player, &candidates, &assignments);
     assignments
+}
+
+fn legal_attack_targets_for_attacker<'a>(
+    attacker_id: ObjectId,
+    valid_attack_targets: Option<&'a [AttackTarget]>,
+    valid_attack_targets_by_attacker: Option<&'a HashMap<ObjectId, Vec<AttackTarget>>>,
+) -> Option<&'a [AttackTarget]> {
+    valid_attack_targets_by_attacker
+        .and_then(|targets| targets.get(&attacker_id).map(Vec::as_slice))
+        .or(valid_attack_targets)
+}
+
+fn preferred_attack_target_for_attacker(
+    attacker_id: ObjectId,
+    preferred_players: &[PlayerId],
+    valid_attack_targets: Option<&[AttackTarget]>,
+    valid_attack_targets_by_attacker: Option<&HashMap<ObjectId, Vec<AttackTarget>>>,
+) -> Option<AttackTarget> {
+    let legal_targets = legal_attack_targets_for_attacker(
+        attacker_id,
+        valid_attack_targets,
+        valid_attack_targets_by_attacker,
+    )?;
+
+    preferred_players
+        .iter()
+        .find_map(|pid| {
+            legal_targets
+                .iter()
+                .copied()
+                .find(|target| *target == AttackTarget::Player(*pid))
+        })
+        .or_else(|| {
+            legal_targets
+                .iter()
+                .copied()
+                .find(|target| matches!(target, AttackTarget::Player(_)))
+        })
+        .or_else(|| legal_targets.first().copied())
 }
 
 /// Single-opponent planeswalker redirect (CR 508.1: legality of attacking a
@@ -448,6 +513,7 @@ fn redirect_attackers_to_planeswalker(
     state: &GameState,
     attacking_ids: &[ObjectId],
     valid_attack_targets: Option<&[AttackTarget]>,
+    valid_attack_targets_by_attacker: Option<&HashMap<ObjectId, Vec<AttackTarget>>>,
     objective: CombatObjective,
     opponent: PlayerId,
     opponent_life: i32,
@@ -456,7 +522,18 @@ fn redirect_attackers_to_planeswalker(
     let all_at_player = || -> Vec<(ObjectId, AttackTarget)> {
         attacking_ids
             .iter()
-            .map(|&id| (id, player_target))
+            .map(|&id| {
+                (
+                    id,
+                    preferred_attack_target_for_attacker(
+                        id,
+                        &[opponent],
+                        valid_attack_targets,
+                        valid_attack_targets_by_attacker,
+                    )
+                    .unwrap_or(player_target),
+                )
+            })
             .collect()
     };
 
@@ -473,16 +550,23 @@ fn redirect_attackers_to_planeswalker(
     }
 
     // Highest-loyalty attackable opponent planeswalker from the engine's list.
-    let Some(targets) = valid_attack_targets else {
-        return all_at_player();
-    };
-    let best_pw = targets
+    let best_pw = attacking_ids
         .iter()
-        .filter_map(|t| match t {
-            AttackTarget::Planeswalker(id) => {
-                let loyalty = state.objects.get(id)?.loyalty.unwrap_or(0);
-                (loyalty > 0).then_some((*id, loyalty as i32))
-            }
+        .filter_map(|&attacker_id| {
+            legal_attack_targets_for_attacker(
+                attacker_id,
+                valid_attack_targets,
+                valid_attack_targets_by_attacker,
+            )
+        })
+        .flatten()
+        .filter_map(|target| match target {
+            AttackTarget::Planeswalker(id) => state
+                .objects
+                .get(id)
+                .and_then(|obj| obj.loyalty)
+                .filter(|loyalty| *loyalty > 0)
+                .map(|loyalty| (*id, loyalty as i32)),
             _ => None,
         })
         .max_by_key(|&(_, loyalty)| loyalty);
@@ -493,6 +577,14 @@ fn redirect_attackers_to_planeswalker(
     // Largest-power-first: the fewest big attackers that sum to >= loyalty.
     let mut by_power: Vec<(ObjectId, i32)> = attacking_ids
         .iter()
+        .filter(|&&id| {
+            legal_attack_targets_for_attacker(
+                id,
+                valid_attack_targets,
+                valid_attack_targets_by_attacker,
+            )
+            .is_some_and(|targets| targets.contains(&AttackTarget::Planeswalker(pw_id)))
+        })
         .filter_map(|&id| Some((id, state.objects.get(&id)?.power.unwrap_or(0))))
         .collect();
     by_power.sort_by_key(|b| std::cmp::Reverse(b.1));
@@ -513,16 +605,32 @@ fn redirect_attackers_to_planeswalker(
     }
 
     let pw_target = AttackTarget::Planeswalker(pw_id);
-    attacking_ids
+    let assignments: Vec<_> = attacking_ids
         .iter()
         .map(|&id| {
             if redirected.contains(&id) {
                 (id, pw_target)
             } else {
-                (id, player_target)
+                (
+                    id,
+                    preferred_attack_target_for_attacker(
+                        id,
+                        &[opponent],
+                        valid_attack_targets,
+                        valid_attack_targets_by_attacker,
+                    )
+                    .unwrap_or(player_target),
+                )
             }
         })
-        .collect()
+        .collect();
+    if !assignments
+        .iter()
+        .any(|(_, target)| *target == player_target)
+    {
+        return all_at_player();
+    }
+    assignments
 }
 
 fn preferred_attack_opponent(
@@ -559,14 +667,10 @@ fn assign_attack_targets(
     player: PlayerId,
     opponents: &[PlayerId],
     attacking_ids: Vec<ObjectId>,
+    valid_attack_targets: Option<&[AttackTarget]>,
+    valid_attack_targets_by_attacker: Option<&HashMap<ObjectId, Vec<AttackTarget>>>,
 ) -> Vec<(ObjectId, AttackTarget)> {
     let threat_ranked = threat_ranked_opponents(state, player, opponents);
-
-    let total_power: i32 = attacking_ids
-        .iter()
-        .filter_map(|&id| state.objects.get(&id))
-        .map(|obj| obj.power.unwrap_or(0))
-        .sum();
 
     // Check for alpha-strike: can we eliminate the weakest opponent?
     let weakest = opponents
@@ -576,10 +680,21 @@ fn assign_attack_targets(
 
     if let Some(weak_opp) = weakest {
         let weak_life = state.players[weak_opp.0 as usize].life;
-        if weak_life > 0 && total_power >= weak_life {
+        let attack_power_vs_weakest: i32 = attacking_ids
+            .iter()
+            .filter(|&&id| {
+                preferred_attack_target_for_attacker(
+                    id,
+                    &[weak_opp],
+                    valid_attack_targets,
+                    valid_attack_targets_by_attacker,
+                ) == Some(AttackTarget::Player(weak_opp))
+            })
+            .filter_map(|&id| state.objects.get(&id).map(|obj| obj.power.unwrap_or(0)))
+            .sum();
+        if weak_life > 0 && attack_power_vs_weakest >= weak_life {
             // Send enough to kill the weakest, rest to highest threat
             let target_weak = AttackTarget::Player(weak_opp);
-            let primary_target = AttackTarget::Player(threat_ranked[0].0);
             let mut result = Vec::new();
             let mut allocated_power = 0;
 
@@ -590,16 +705,40 @@ fn assign_attack_targets(
                 .collect();
             sorted_attackers.sort_by_key(|&(_, p)| p);
 
+            let secondary_players: Vec<PlayerId> = if weak_opp == threat_ranked[0].0 {
+                vec![weak_opp]
+            } else {
+                let mut players = vec![threat_ranked[0].0];
+                players.extend(
+                    threat_ranked
+                        .iter()
+                        .map(|(pid, _)| *pid)
+                        .filter(|pid| *pid != threat_ranked[0].0),
+                );
+                players
+            };
             for (id, power) in sorted_attackers {
-                if allocated_power < weak_life {
+                if allocated_power < weak_life
+                    && preferred_attack_target_for_attacker(
+                        id,
+                        &[weak_opp],
+                        valid_attack_targets,
+                        valid_attack_targets_by_attacker,
+                    ) == Some(target_weak)
+                {
                     result.push((id, target_weak));
                     allocated_power += power;
                 } else {
-                    // If weakest IS the highest threat, keep sending there
                     let target = if weak_opp == threat_ranked[0].0 {
                         target_weak
                     } else {
-                        primary_target
+                        preferred_attack_target_for_attacker(
+                            id,
+                            &secondary_players,
+                            valid_attack_targets,
+                            valid_attack_targets_by_attacker,
+                        )
+                        .unwrap_or(target_weak)
                     };
                     result.push((id, target));
                 }
@@ -611,10 +750,28 @@ fn assign_attack_targets(
     // Default: pressure the next opponent in turn order unless one opponent is
     // a clear archenemy. This prevents every bot in a multiplayer pod from
     // dogpiling the same seat on small, noisy threat-score differences.
-    let primary = AttackTarget::Player(
-        multiplayer_pressure_target(state, player, opponents).unwrap_or(threat_ranked[0].0),
+    let primary =
+        multiplayer_pressure_target(state, player, opponents).unwrap_or(threat_ranked[0].0);
+    let mut preferred_players: Vec<PlayerId> = vec![primary];
+    preferred_players.extend(
+        threat_ranked
+            .iter()
+            .map(|(pid, _)| *pid)
+            .filter(|pid| *pid != primary),
     );
-    attacking_ids.into_iter().map(|id| (id, primary)).collect()
+    attacking_ids
+        .into_iter()
+        .map(|id| {
+            let target = preferred_attack_target_for_attacker(
+                id,
+                &preferred_players,
+                valid_attack_targets,
+                valid_attack_targets_by_attacker,
+            )
+            .unwrap_or(AttackTarget::Player(primary));
+            (id, target)
+        })
+        .collect()
 }
 
 const MULTIPLAYER_FOCUS_THREAT_MARGIN: f64 = 0.18;
@@ -3441,6 +3598,7 @@ mod tests {
             false,
             None,
             Some(&targets),
+            None,
         );
 
         // The lone 5/5 (>= loyalty 3) goes at the planeswalker; the 2/2s at the player.
@@ -3475,6 +3633,7 @@ mod tests {
             false,
             None,
             Some(&targets),
+            None,
         );
         assert!(
             attacks
@@ -3500,6 +3659,7 @@ mod tests {
             false,
             None,
             Some(&targets),
+            None,
         );
         assert!(
             attacks
@@ -3528,6 +3688,7 @@ mod tests {
             false,
             None,
             Some(&targets),
+            None,
         );
         assert!(
             attacks
@@ -3557,10 +3718,40 @@ mod tests {
             false,
             None,
             Some(&targets),
+            None,
         );
         assert_eq!(
             attacks.iter().find(|(id, _)| *id == bear).map(|(_, t)| *t),
             Some(AttackTarget::Player(PlayerId(1))),
+        );
+    }
+
+    #[test]
+    fn per_attacker_targets_override_global_attack_preferences() {
+        let mut state = setup_multiplayer(3);
+        let attacker = add_creature(&mut state, PlayerId(0), "Scout", 3, 3, vec![]);
+        state.players[1].life = 2;
+        state.players[2].life = 20;
+        let global_targets = vec![
+            AttackTarget::Player(PlayerId(1)),
+            AttackTarget::Player(PlayerId(2)),
+        ];
+        let scoped_targets = HashMap::from([(attacker, vec![AttackTarget::Player(PlayerId(2))])]);
+
+        let attacks = choose_attackers_with_targets_with_profile(
+            &state,
+            PlayerId(0),
+            &AiProfile::default(),
+            false,
+            Some(&[attacker]),
+            Some(&global_targets),
+            Some(&scoped_targets),
+        );
+
+        assert_eq!(
+            attacks,
+            vec![(attacker, AttackTarget::Player(PlayerId(2)))],
+            "per-attacker legality must override the global weakest-opponent heuristic"
         );
     }
 }
