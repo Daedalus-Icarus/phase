@@ -8480,7 +8480,7 @@ mod tests {
         assert!(
             result
                 .unwrap_err()
-                .contains("must attack a different player if able"),
+                .contains("must attack a different player directly if able"),
             "an attackable non-goading opponent (P2) must still force the redirect"
         );
     }
