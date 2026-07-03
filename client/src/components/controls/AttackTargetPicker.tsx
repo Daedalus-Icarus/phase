@@ -8,7 +8,7 @@ import { usePlayerId } from "../../hooks/usePlayerId.ts";
 import { getSeatColor } from "../../hooks/useSeatColor.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { getPlayerDisplayName } from "../../stores/multiplayerStore.ts";
-import { type AttackerStack, groupAttackers } from "../../utils/combat.ts";
+import { type AttackerStack, evenSplit, groupAttackers } from "../../utils/combat.ts";
 import { formatCounterType } from "../../viewmodel/cardProps.ts";
 import { PeekTab } from "../modal/DialogShell.tsx";
 import { gameButtonClass } from "../ui/buttonStyles.ts";
@@ -727,8 +727,11 @@ function stackFullySupportsTarget(
 
 /**
  * Redistribute a stack as evenly as legality allows across display-order
- * targets. Each member is assigned to the currently least-populated legal
- * target, breaking ties by target order.
+ * targets. Uses the shared `evenSplit` building block to compute per-target
+ * capacities (remainder front-loaded to the earliest targets), then fills
+ * targets in display order with ascending-id members — so the lowest-id
+ * members claim the earliest targets deterministically, matching the per-target
+ * stepper's "lowest-id unassigned member" convention.
  */
 function spreadStackEvenly(
   map: AssignmentMap,
@@ -737,7 +740,12 @@ function spreadStackEvenly(
   targetsForCreature: (creatureId: ObjectId) => AttackTarget[],
 ): void {
   if (targets.length === 0) return;
-  const counts = new Map<string, number>();
+  const split = evenSplit(stack.ids.length, targets.length);
+  const cap = new Map<string, number>();
+  for (let i = 0; i < targets.length; i++) {
+    cap.set(attackTargetKey(targets[i]), split[i]);
+  }
+  const used = new Map<string, number>();
   for (const id of stack.ids) {
     const legalTargets = targets.filter((target) =>
       targetsForCreature(id).some((candidate) => sameAttackTarget(candidate, target)),
@@ -746,18 +754,17 @@ function spreadStackEvenly(
       map.set(id, null);
       continue;
     }
-    let bestTarget = legalTargets[0];
-    let bestCount = counts.get(attackTargetKey(bestTarget)) ?? 0;
-    for (const target of legalTargets.slice(1)) {
-      const count = counts.get(attackTargetKey(target)) ?? 0;
-      if (count < bestCount) {
-        bestTarget = target;
-        bestCount = count;
-      }
-    }
-    map.set(id, bestTarget);
-    const key = attackTargetKey(bestTarget);
-    counts.set(key, (counts.get(key) ?? 0) + 1);
+    // Assign to the first legal target (display order) with remaining capacity;
+    // fall back to the first legal target when all are full (overfill rather
+    // than leave the member unassigned).
+    const target =
+      legalTargets.find((t) => {
+        const key = attackTargetKey(t);
+        return (used.get(key) ?? 0) < (cap.get(key) ?? 0);
+      }) ?? legalTargets[0];
+    map.set(id, target);
+    const key = attackTargetKey(target);
+    used.set(key, (used.get(key) ?? 0) + 1);
   }
 }
 

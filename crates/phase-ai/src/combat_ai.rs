@@ -137,15 +137,26 @@ pub fn choose_attackers_with_targets(
     state: &GameState,
     player: PlayerId,
 ) -> Vec<(ObjectId, AttackTarget)> {
-    let valid_attack_targets = engine::game::combat::get_valid_attack_targets(state);
-    let valid_attack_targets_by_attacker =
-        engine::game::combat::get_valid_attack_targets_by_attacker(state);
+    // The engine's `get_valid_attack_targets` / `get_valid_attack_targets_by_attacker`
+    // are scoped to `state.active_player`. Only thread them through when the
+    // decision is for that player; otherwise (multiplayer tests, hypothetical
+    // scenarios where `player != active_player`) fall back to the local
+    // `can_attack` + `players::opponents` derivation so non-active players still
+    // get a rules-correct candidate set and target assignment.
+    let (valid_attack_targets, valid_attack_targets_by_attacker) = if player == state.active_player
+    {
+        let targets = engine::game::combat::get_valid_attack_targets(state);
+        let by_attacker = engine::game::combat::get_valid_attack_targets_by_attacker(state);
+        (Some(targets), Some(by_attacker))
+    } else {
+        (None, None)
+    };
     choose_attackers_with_targets_with_profile(
         state,
         player,
         ChooseAttackersWithTargetsOptions::new(&AiProfile::default())
-            .with_valid_attack_targets(Some(&valid_attack_targets))
-            .with_valid_attack_targets_by_attacker(Some(&valid_attack_targets_by_attacker)),
+            .with_valid_attack_targets(valid_attack_targets.as_deref())
+            .with_valid_attack_targets_by_attacker(valid_attack_targets_by_attacker.as_ref()),
     )
 }
 
@@ -532,8 +543,16 @@ fn legal_attack_targets_for_attacker<'a>(
     valid_attack_targets: Option<&'a [AttackTarget]>,
     valid_attack_targets_by_attacker: Option<&'a HashMap<ObjectId, Vec<AttackTarget>>>,
 ) -> Option<&'a [AttackTarget]> {
-    if let Some(targets) = valid_attack_targets_by_attacker {
-        return targets.get(&attacker_id).map(Vec::as_slice);
+    // CR 508.1b/c/d: when the per-attacker map is present, use the attacker's
+    // scoped target set; if the attacker is absent from the map, fall back to
+    // the global `valid_attack_targets` — matching the engine's own candidate
+    // generator (`attacker_actions`), which does the same `unwrap_or` fallback.
+    // This keeps tests and scenarios that supply an empty map (or a stale
+    // snapshot) from collapsing every attacker to "no legal targets."
+    if let Some(by_attacker) = valid_attack_targets_by_attacker {
+        if let Some(targets) = by_attacker.get(&attacker_id) {
+            return Some(targets.as_slice());
+        }
     }
     valid_attack_targets
 }
