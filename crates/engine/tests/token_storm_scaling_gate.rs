@@ -18,7 +18,9 @@
 //! process-per-test harness.
 
 use engine::ai_support::legal_actions_full;
-use engine::game::combat::{get_valid_attack_targets, get_valid_attacker_ids};
+use engine::game::combat::{
+    get_valid_attack_targets, get_valid_attack_targets_by_attacker, get_valid_attacker_ids,
+};
 use engine::game::layers;
 use engine::game::perf_counters;
 use engine::game::targeting::find_legal_targets;
@@ -195,6 +197,7 @@ fn token_storm_declare_attackers_gate() {
         player: active,
         valid_attacker_ids,
         valid_attack_targets,
+        valid_attack_targets_by_attacker: get_valid_attack_targets_by_attacker(&restored),
     };
 
     perf_counters::reset();
