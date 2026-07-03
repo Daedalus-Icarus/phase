@@ -143,24 +143,72 @@ pub fn choose_attackers_with_targets(
     choose_attackers_with_targets_with_profile(
         state,
         player,
-        &AiProfile::default(),
-        false,
-        None,
-        Some(&valid_attack_targets),
-        Some(&valid_attack_targets_by_attacker),
-        None,
+        ChooseAttackersWithTargetsOptions::new(&AiProfile::default())
+            .with_valid_attack_targets(Some(&valid_attack_targets))
+            .with_valid_attack_targets_by_attacker(Some(&valid_attack_targets_by_attacker)),
     )
+}
+
+pub struct ChooseAttackersWithTargetsOptions<'a> {
+    profile: &'a AiProfile,
+    combat_lookahead: bool,
+    valid_attacker_ids: Option<&'a [ObjectId]>,
+    valid_attack_targets: Option<&'a [AttackTarget]>,
+    valid_attack_targets_by_attacker: Option<&'a HashMap<ObjectId, Vec<AttackTarget>>>,
+    session: Option<&'a AiSession>,
+}
+
+impl<'a> ChooseAttackersWithTargetsOptions<'a> {
+    pub(crate) fn new(profile: &'a AiProfile) -> Self {
+        Self {
+            profile,
+            combat_lookahead: false,
+            valid_attacker_ids: None,
+            valid_attack_targets: None,
+            valid_attack_targets_by_attacker: None,
+            session: None,
+        }
+    }
+
+    pub(crate) fn with_combat_lookahead(mut self, combat_lookahead: bool) -> Self {
+        self.combat_lookahead = combat_lookahead;
+        self
+    }
+
+    pub(crate) fn with_valid_attacker_ids(
+        mut self,
+        valid_attacker_ids: Option<&'a [ObjectId]>,
+    ) -> Self {
+        self.valid_attacker_ids = valid_attacker_ids;
+        self
+    }
+
+    pub(crate) fn with_valid_attack_targets(
+        mut self,
+        valid_attack_targets: Option<&'a [AttackTarget]>,
+    ) -> Self {
+        self.valid_attack_targets = valid_attack_targets;
+        self
+    }
+
+    pub(crate) fn with_valid_attack_targets_by_attacker(
+        mut self,
+        valid_attack_targets_by_attacker: Option<&'a HashMap<ObjectId, Vec<AttackTarget>>>,
+    ) -> Self {
+        self.valid_attack_targets_by_attacker = valid_attack_targets_by_attacker;
+        self
+    }
+
+    pub(crate) fn with_session(mut self, session: Option<&'a AiSession>) -> Self {
+        self.session = session;
+        self
+    }
 }
 
 pub fn choose_attackers_with_targets_with_profile(
     state: &GameState,
     player: PlayerId,
-    profile: &AiProfile,
-    combat_lookahead: bool,
-    valid_attacker_ids: Option<&[ObjectId]>,
-    valid_attack_targets: Option<&[AttackTarget]>,
-    valid_attack_targets_by_attacker: Option<&HashMap<ObjectId, Vec<AttackTarget>>>,
-    session: Option<&AiSession>,
+    options: ChooseAttackersWithTargetsOptions<'_>,
 ) -> Vec<(ObjectId, AttackTarget)> {
     let opponents = players::opponents(state, player);
     if opponents.is_empty() {
@@ -169,9 +217,9 @@ pub fn choose_attackers_with_targets_with_profile(
 
     // Use engine-provided valid attacker list when available; fall back to
     // local can_attack() for tests and hypothetical scenarios.
-    let candidates: Vec<ObjectId> = if let Some(ids) = valid_attacker_ids {
+    let candidates: Vec<ObjectId> = if let Some(ids) = options.valid_attacker_ids {
         ids.to_vec()
-    } else if let Some(targets_by_attacker) = valid_attack_targets_by_attacker {
+    } else if let Some(targets_by_attacker) = options.valid_attack_targets_by_attacker {
         state
             .battlefield
             .iter()
@@ -242,7 +290,7 @@ pub fn choose_attackers_with_targets_with_profile(
         &opponents,
         &candidates,
         &opponent_blockers,
-        profile,
+        options.profile,
     );
 
     // Hoist the block-legality static slices once for the whole candidate sweep —
@@ -369,8 +417,8 @@ pub fn choose_attackers_with_targets_with_profile(
         // crackback_damage sees scaled creatures (Ouroboroid class) and
         // attack-trigger pumps (Battle Cry, Mentor). Failure to project
         // falls through to current state — matches pre-projection behavior.
-        let projection: Option<Arc<Projection>> = if combat_lookahead {
-            match session {
+        let projection: Option<Arc<Projection>> = if options.combat_lookahead {
+            match options.session {
                 // Session present: route through the per-game projection cache
                 // (turn-scoped key; identical result to project_to on a miss,
                 // cached on subsequent identical combat decisions this turn).
@@ -456,8 +504,8 @@ pub fn choose_attackers_with_targets_with_profile(
         let assignments = redirect_attackers_to_planeswalker(
             state,
             &attacking_ids,
-            valid_attack_targets,
-            valid_attack_targets_by_attacker,
+            options.valid_attack_targets,
+            options.valid_attack_targets_by_attacker,
             objective,
             opp,
             opponent_life,
@@ -472,8 +520,8 @@ pub fn choose_attackers_with_targets_with_profile(
         player,
         &opponents,
         attacking_ids,
-        valid_attack_targets,
-        valid_attack_targets_by_attacker,
+        options.valid_attack_targets,
+        options.valid_attack_targets_by_attacker,
     );
     emit_attack_trace(player, &candidates, &assignments);
     assignments
@@ -3618,12 +3666,8 @@ mod tests {
         let attacks = choose_attackers_with_targets_with_profile(
             &state,
             PlayerId(0),
-            &AiProfile::default(),
-            false,
-            None,
-            Some(&targets),
-            None,
-            None,
+            ChooseAttackersWithTargetsOptions::new(&AiProfile::default())
+                .with_valid_attack_targets(Some(&targets)),
         );
 
         // The lone 5/5 (>= loyalty 3) goes at the planeswalker; the 2/2s at the player.
@@ -3654,12 +3698,8 @@ mod tests {
         let attacks = choose_attackers_with_targets_with_profile(
             &state,
             PlayerId(0),
-            &AiProfile::default(),
-            false,
-            None,
-            Some(&targets),
-            None,
-            None,
+            ChooseAttackersWithTargetsOptions::new(&AiProfile::default())
+                .with_valid_attack_targets(Some(&targets)),
         );
         assert!(
             attacks
@@ -3681,12 +3721,8 @@ mod tests {
         let attacks = choose_attackers_with_targets_with_profile(
             &state,
             PlayerId(0),
-            &AiProfile::default(),
-            false,
-            None,
-            Some(&targets),
-            None,
-            None,
+            ChooseAttackersWithTargetsOptions::new(&AiProfile::default())
+                .with_valid_attack_targets(Some(&targets)),
         );
         assert!(
             attacks
@@ -3711,12 +3747,8 @@ mod tests {
         let attacks = choose_attackers_with_targets_with_profile(
             &state,
             PlayerId(0),
-            &AiProfile::default(),
-            false,
-            None,
-            Some(&targets),
-            None,
-            None,
+            ChooseAttackersWithTargetsOptions::new(&AiProfile::default())
+                .with_valid_attack_targets(Some(&targets)),
         );
         assert!(
             attacks
@@ -3742,12 +3774,8 @@ mod tests {
         let attacks = choose_attackers_with_targets_with_profile(
             &state,
             PlayerId(0),
-            &AiProfile::default(),
-            false,
-            None,
-            Some(&targets),
-            None,
-            None,
+            ChooseAttackersWithTargetsOptions::new(&AiProfile::default())
+                .with_valid_attack_targets(Some(&targets)),
         );
         assert_eq!(
             attacks.iter().find(|(id, _)| *id == bear).map(|(_, t)| *t),
@@ -3770,12 +3798,10 @@ mod tests {
         let attacks = choose_attackers_with_targets_with_profile(
             &state,
             PlayerId(0),
-            &AiProfile::default(),
-            false,
-            Some(&[attacker]),
-            Some(&global_targets),
-            Some(&scoped_targets),
-            None,
+            ChooseAttackersWithTargetsOptions::new(&AiProfile::default())
+                .with_valid_attacker_ids(Some(&[attacker]))
+                .with_valid_attack_targets(Some(&global_targets))
+                .with_valid_attack_targets_by_attacker(Some(&scoped_targets)),
         );
 
         assert_eq!(
@@ -3823,12 +3849,9 @@ mod tests {
         let _ = choose_attackers_with_targets_with_profile(
             &state,
             PlayerId(0),
-            &profile,
-            /* combat_lookahead = */ true,
-            None,
-            None,
-            None,
-            Some(&session),
+            ChooseAttackersWithTargetsOptions::new(&profile)
+                .with_combat_lookahead(true)
+                .with_session(Some(&session)),
         );
 
         let expected = ProjectionKey {
@@ -3865,12 +3888,9 @@ mod tests {
         let _ = choose_attackers_with_targets_with_profile(
             &state,
             PlayerId(0),
-            &profile,
-            /* combat_lookahead = */ false,
-            None,
-            None,
-            None,
-            Some(&session),
+            ChooseAttackersWithTargetsOptions::new(&profile)
+                .with_combat_lookahead(false)
+                .with_session(Some(&session)),
         );
 
         assert!(
@@ -3891,22 +3911,14 @@ mod tests {
         let with_session = choose_attackers_with_targets_with_profile(
             &state,
             PlayerId(0),
-            &profile,
-            /* combat_lookahead = */ true,
-            None,
-            None,
-            None,
-            Some(&AiSession::empty()),
+            ChooseAttackersWithTargetsOptions::new(&profile)
+                .with_combat_lookahead(true)
+                .with_session(Some(&AiSession::empty())),
         );
         let without_session = choose_attackers_with_targets_with_profile(
             &state,
             PlayerId(0),
-            &profile,
-            /* combat_lookahead = */ true,
-            None,
-            None,
-            None,
-            None,
+            ChooseAttackersWithTargetsOptions::new(&profile).with_combat_lookahead(true),
         );
 
         assert_eq!(

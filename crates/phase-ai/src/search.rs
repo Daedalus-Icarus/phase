@@ -20,7 +20,10 @@ use engine::types::statics::StaticMode;
 use engine::types::zones::Zone;
 
 use crate::cast_facts::cast_facts_for_action;
-use crate::combat_ai::{choose_attackers_with_targets_with_profile, choose_blockers_with_profile};
+use crate::combat_ai::{
+    choose_attackers_with_targets_with_profile, choose_blockers_with_profile,
+    ChooseAttackersWithTargetsOptions,
+};
 use crate::config::{AiConfig, PlannerMode, ThreatAwareness};
 use crate::context::AiContext;
 use crate::features::DeckFeatures;
@@ -2392,12 +2395,12 @@ pub(crate) fn deterministic_choice(
         let attacks = choose_attackers_with_targets_with_profile(
             state,
             ai_player,
-            &config.profile,
-            config.combat_lookahead,
-            Some(valid_attacker_ids),
-            Some(valid_attack_targets),
-            Some(valid_attack_targets_by_attacker),
-            context.map(|c| c.session.as_ref()),
+            ChooseAttackersWithTargetsOptions::new(&config.profile)
+                .with_combat_lookahead(config.combat_lookahead)
+                .with_valid_attacker_ids(Some(valid_attacker_ids))
+                .with_valid_attack_targets(Some(valid_attack_targets))
+                .with_valid_attack_targets_by_attacker(Some(valid_attack_targets_by_attacker))
+                .with_session(context.map(|c| c.session.as_ref())),
         );
         return Some(validated_declare_attackers(state, attacks));
     }
@@ -2455,12 +2458,11 @@ fn deterministic_combat_choice(
         let attacks = choose_attackers_with_targets_with_profile(
             state,
             ai_player,
-            profile,
-            false,
-            Some(valid_attacker_ids),
-            Some(valid_attack_targets),
-            Some(valid_attack_targets_by_attacker),
-            session,
+            ChooseAttackersWithTargetsOptions::new(profile)
+                .with_valid_attacker_ids(Some(valid_attacker_ids))
+                .with_valid_attack_targets(Some(valid_attack_targets))
+                .with_valid_attack_targets_by_attacker(Some(valid_attack_targets_by_attacker))
+                .with_session(session),
         );
         return Some(validated_declare_attackers(state, attacks));
     }
