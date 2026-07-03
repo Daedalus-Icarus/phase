@@ -1927,6 +1927,58 @@ fn starts_remove_counter_clause_lower(s: &str) -> OracleResult<'_, ()> {
     Ok((rest, ()))
 }
 
+/// CR 601.2c + CR 508.1d + CR 509.1c: A second `"[up to] <n> target <filter>"`
+/// conjunct joined by a bare `" and "` opens its OWN target (each instance of
+/// the word "target" is a distinct target — CR 601.2c) and applies its own
+/// combat requirement — an attack/block compulsion ("attacks or blocks this
+/// combat if able", CR 508.1d/509.1c) or a combat prohibition ("can't attack or
+/// block"). Boros Battleshaper: "... up to one target creature attacks or blocks
+/// this combat if able and up to one target creature can't attack or block this
+/// combat." Without this arm the second conjunct is not recognized as a clause
+/// start (its subject is a noun phrase, not an imperative verb), so it is
+/// swallowed and only one combat half parses. The discriminator is a
+/// combat-requirement predicate (attacks/blocks/can't attack/can't block) after
+/// the `"[up to] <n> target <filter>"` subject — a genuine noun-phrase
+/// continuation ("destroy up to one target creature and up to one target
+/// artifact") has no such verb and is left un-split. The predicate search is
+/// bounded to THIS conjunct's segment (up to the next `" and "`) so a combat
+/// verb in a later conjunct cannot trigger a false split. Combat sibling of
+/// `starts_target_continuous_clause_lower`.
+fn starts_up_to_target_combat_clause_lower(s: &str) -> OracleResult<'_, ()> {
+    // Subject accepts both the counted "[up to] <n> target <filter>" form and the
+    // bare "target <filter>" form — CR 601.2c: every "target" opens its own
+    // target, numbered or not. An unnumbered second conjunct ("… and target
+    // creature can't block this combat") therefore splits identically to the
+    // counted Boros shape; the combat-requirement predicate below stays the
+    // discriminator, so a bare-`target` noun-phrase continuation with no combat
+    // verb is still left un-split.
+    let (rest, _) = alt((
+        value(
+            (),
+            (
+                opt(tag::<_, _, OracleError<'_>>("up to ")),
+                nom_primitives::parse_number,
+                tag(" target "),
+            ),
+        ),
+        value((), tag::<_, _, OracleError<'_>>("target ")),
+    ))
+    .parse(s)?;
+    // Bound the combat-predicate search to THIS conjunct segment only.
+    let segment = match take_until::<_, _, OracleError<'_>>(" and ").parse(rest) {
+        Ok((_, seg)) => seg,
+        Err(_) => rest,
+    };
+    let _ = alt((
+        value((), (take_until("can't attack"), tag("can't attack"))),
+        value((), (take_until("can't block"), tag("can't block"))),
+        value((), (take_until("attacks "), tag("attacks "))),
+        value((), (take_until("blocks "), tag("blocks "))),
+    ))
+    .parse(segment)?;
+    Ok((rest, ()))
+}
+
 /// Inner implementation operating on pre-lowercased input.
 fn starts_bare_and_clause_lower(s: &str) -> bool {
     // CR 613.1b + CR 110.2: "<player-subject> gains control of …" control-handoff
@@ -2242,6 +2294,12 @@ fn starts_bare_and_clause_lower(s: &str) -> bool {
         value((), tag::<_, _, OracleError<'_>>("may play ")),
         value((), tag("may cast ")),
     )))
+    // CR 601.2c + CR 508.1d/509.1c: a fresh "[up to] <n> target <filter>"
+    // conjunct + combat-requirement predicate opens its own target and combat
+    // compulsion/prohibition (Boros Battleshaper). Trailing `.or()` arm
+    // (mirroring `starts_target_continuous_clause_lower`) so the `alt(...)`
+    // cluster stays under nom's 21-arm limit.
+    .or(value((), starts_up_to_target_combat_clause_lower))
     .parse(s)
     .is_ok();
     if has_verb_prefix {
@@ -5425,6 +5483,18 @@ pub(super) fn parse_followup_continuation_ast(
                 reorder_all: false,
             })
         }
+        // CR 701.20a + CR 608.2c: A reveal-until rest-pile clause may be
+        // separated from the RevealUntil by a transparent intervening effect
+        // ("~ deals damage equal to that card's mana value. Put that card into
+        // your hand and the rest ..."). Recognize the rest-pile clause here;
+        // apply_continuation_ast searches backward to patch the earlier
+        // RevealUntil, so no standalone PutAtLibraryPosition is emitted.
+        Effect::DealDamage { .. } if is_reveal_until_rest_pile_clause_after_intervening_effect(&lower) => {
+            Some(ContinuationAst::PutRest {
+                destination: parse_reveal_until_rest_zone(&lower).unwrap_or(Zone::Library),
+                reorder_all: false,
+            })
+        }
         // CR 701.20a + CR 608.2c: "Put any number of those [filter] cards onto the
         // battlefield, then put the rest … on the bottom … in a random order"
         // (Aurora Awakener). This is the multi-match disposition over the *set* of
@@ -5876,6 +5946,13 @@ pub(super) fn parse_followup_continuation_ast(
     }
 }
 
+fn is_reveal_until_rest_pile_clause_after_intervening_effect(lower: &str) -> bool {
+    parse_reveal_until_rest_zone(lower).is_some()
+        && (nom_primitives::scan_contains(lower, "that card")
+            || nom_primitives::scan_contains(lower, "nonland card")
+            || nom_primitives::scan_contains(lower, "revealed this way"))
+}
+
 fn parse_choose_and_sacrifice_rest_followup(lower: &str) -> Option<ContinuationAst> {
     type E<'a> = OracleError<'a>;
     let lower = lower.trim();
@@ -6268,7 +6345,7 @@ pub(super) fn parse_keyword_grant_list(input: &str) -> Option<(Vec<Keyword>, &st
 /// `GenericEffect` clause and clones its grant template once per keyword.
 /// Generalized over the whole evergreen-keyword vocabulary — covers every card
 /// of this "the same is true for …" class, not Odric alone.
-pub(super) fn try_parse_same_is_true_continuation(text: &str) -> Option<Vec<Keyword>> {
+pub(crate) fn try_parse_same_is_true_continuation(text: &str) -> Option<Vec<Keyword>> {
     let lower = text.to_lowercase();
     let (keywords, rest) = nom_on_lower(text, &lower, |i| {
         let (i, _) = tag("the same is true for ").parse(i)?;

@@ -84,7 +84,6 @@ use super::oracle_util::{
     contains_possessive, has_unconsumed_conditional, parse_count_expr, parse_mana_symbols,
     parse_number, split_around, starts_with_possessive, strip_after, TextPair,
 };
-use crate::database::mtgjson::parse_mtgjson_mana_cost;
 use crate::game::triggers;
 use crate::parser::oracle_effect::subject::parse_subject_application;
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
@@ -544,6 +543,11 @@ fn parse_dealt_damage_this_way_dies_trigger(
 /// Delegates to the shared word-boundary scanning primitive in `oracle_nom::primitives`.
 fn scan_contains_phrase(text: &str, phrase: &str) -> bool {
     nom_primitives::scan_contains(text, phrase)
+}
+
+fn has_unless_clause(text: &str) -> bool {
+    nom_primitives::scan_preceded(text, |i| tag::<_, _, OracleError<'_>>("unless ").parse(i))
+        .is_some()
 }
 
 /// Windows that terminate the condition of an inline delayed trigger and
@@ -4862,6 +4866,29 @@ fn parsed_unless_unsupported_clause(full_text: &str, rider: &str) -> ParsedEffec
     ))
 }
 
+fn counter_unless_payment_is_unsupported(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let Some((_, rest_original)) = nom_on_lower(text, &lower, |i| {
+        value(
+            (),
+            alt((
+                tag::<_, _, OracleError<'_>>("counter all "),
+                tag("counter each "),
+                tag("counter "),
+            )),
+        )
+        .parse(i)
+    }) else {
+        return false;
+    };
+    let rest_lower = &lower[lower.len() - rest_original.len()..];
+    has_unless_clause(rest_lower) && parse_unless_payment(rest_lower).is_none()
+}
+
+fn parsed_unless_payment_unsupported_clause(full_text: &str) -> ParsedEffectClause {
+    parsed_clause(Effect::unimplemented("unless_payment", full_text))
+}
+
 fn attach_unless_slots(
     mut clause: ParsedEffectClause,
     unless_condition: Option<AbilityCondition>,
@@ -4891,6 +4918,8 @@ fn parse_effect_clause(text: &str, ctx: &mut ParseContext) -> ParsedEffectClause
             if unless_pay.is_some() {
                 unless_pay_deferred = unless_pay;
                 (None, stripped)
+            } else if counter_unless_payment_is_unsupported(text) {
+                return parsed_unless_payment_unsupported_clause(text);
             } else if unless_rider_defers_to_body_parser(text) {
                 (None, clause_text)
             } else {
@@ -5585,6 +5614,9 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
             name: "empty".to_string(),
             description: None,
         });
+    }
+    if counter_unless_payment_is_unsupported(text) {
+        return parsed_unless_payment_unsupported_clause(text);
     }
     // CR 608.2c: Self-ref continuation adverb. "also" after a self-ref subject
     // is a natural-language additive connector with no semantic weight — it
@@ -6583,10 +6615,11 @@ fn try_parse_intensify(tp: TextPair) -> Option<Effect> {
 /// and toughness N/N [and gains [keyword(s)]]" → [`Effect::ApplyPerpetual`]
 /// with [`PerpetualModification::Become`] (Second Little Pig).
 ///
-/// Self-subjects only; referenced-object forms ("the duplicate"/"it") are
-/// deferred. The clause tail must be fully consumed so compound riders that
-/// are not modeled (e.g. Heir to Dragonfire's ", gets +3/+3") fall through to
-/// `Unimplemented` rather than being silently dropped.
+/// Self-subjects only; referenced-object forms ("the duplicate"/"its") are
+/// handled by [`try_parse_perpetual_base_pt`]. The clause tail must be fully
+/// consumed so compound riders that are not modeled (e.g. Heir to Dragonfire's
+/// ", gets +3/+3") fall through to `Unimplemented` rather than being silently
+/// dropped.
 fn try_parse_perpetual_become(tp: TextPair) -> Option<Effect> {
     use crate::parser::oracle_util::parse_subtype;
 
@@ -6665,24 +6698,80 @@ fn try_parse_perpetual_become(tp: TextPair) -> Option<Effect> {
     })
 }
 
-/// Digital-only Alchemy: parse the self-subject base-P/T "perpetually" form —
-/// "[~ / it / this creature / …] perpetually become(s)/has base power and
-/// toughness N/N" → [`Effect::ApplyPerpetual`] with
-/// [`PerpetualModification::SetBasePowerToughness`] (High Fae Prankster).
+/// Digital-only Alchemy: parse the base-P/T "perpetually" form —
+/// self-subject ("[~ / this creature / …] perpetually become(s)/has base power
+/// and toughness N/N"), referenced-object ("the duplicate perpetually has …"),
+/// and prior-clause anaphor ("its base power and toughness perpetually
+/// become …") → [`Effect::ApplyPerpetual`] with
+/// [`PerpetualModification::SetBasePowerToughness`] (High Fae Prankster, Three
+/// Tree Battalion, Blood Age Muster).
 ///
-/// Increment 1 handles only the self-subject (resolved to the source). The
-/// referenced-object forms ("the duplicate"/"its base power and toughness
-/// perpetually become …", Three Tree Battalion, Blood Age Muster) are left to
-/// `Unimplemented` until the referenced-object target wiring lands. The clause
-/// tail must be fully consumed so riders (e.g. "… and gains flying") fall
-/// through instead of being silently dropped.
+/// The clause tail must be fully consumed so riders (e.g. "… and gains flying")
+/// fall through instead of being silently dropped.
 fn try_parse_perpetual_base_pt(tp: TextPair) -> Option<Effect> {
+    fn tail_done(tail: &str) -> bool {
+        tail.is_empty() || tail == "."
+    }
+
+    fn parse_base_pt_values(rest: &str) -> Option<(i32, i32, &str)> {
+        let (rest, power) = nom_primitives::parse_number(rest).ok()?;
+        let (rest, _) = tag::<_, _, OracleError<'_>>("/").parse(rest).ok()?;
+        let (rest, toughness) = nom_primitives::parse_number(rest).ok()?;
+        tail_done(rest).then_some((power as i32, toughness as i32, rest))
+    }
+
     let lower = tp.lower;
+
+    // Referenced object: "The duplicate perpetually has base power and toughness 1/1."
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("the duplicate perpetually ").parse(lower) {
+        let (rest, _) = alt((
+            tag::<_, _, OracleError<'_>>("becomes "),
+            tag::<_, _, OracleError<'_>>("become "),
+            tag::<_, _, OracleError<'_>>("has "),
+            tag::<_, _, OracleError<'_>>("have "),
+        ))
+        .parse(rest)
+        .ok()?;
+        let (rest, _) = tag::<_, _, OracleError<'_>>("base power and toughness ")
+            .parse(rest)
+            .ok()?;
+        let (power, toughness, _) = parse_base_pt_values(rest)?;
+        return Some(Effect::ApplyPerpetual {
+            target: TargetFilter::ParentTarget,
+            modification: crate::types::ability::PerpetualModification::SetBasePowerToughness {
+                power,
+                toughness,
+            },
+        });
+    }
+
+    // Prior-clause anaphor: "Its base power and toughness perpetually become 2/2."
+    if let Ok((rest, _)) =
+        tag::<_, _, OracleError<'_>>("its base power and toughness perpetually ").parse(lower)
+    {
+        let (rest, _) = alt((
+            tag::<_, _, OracleError<'_>>("becomes "),
+            tag::<_, _, OracleError<'_>>("become "),
+            tag::<_, _, OracleError<'_>>("has "),
+            tag::<_, _, OracleError<'_>>("have "),
+        ))
+        .parse(rest)
+        .ok()?;
+        let (power, toughness, _) = parse_base_pt_values(rest)?;
+        return Some(Effect::ApplyPerpetual {
+            target: TargetFilter::ParentTarget,
+            modification: crate::types::ability::PerpetualModification::SetBasePowerToughness {
+                power,
+                toughness,
+            },
+        });
+    }
+
+    // Self-subject: "~ perpetually has base power and toughness 4/1."
     // Only unambiguous self-subjects. The anaphoric "it " is intentionally
     // excluded: after a prior object choice it refers to that object, not the
     // source, so accepting it here would let a referenced-object perpetual clause
-    // parse as supported while mutating the wrong object. Referenced-object forms
-    // ("the duplicate"/"its …") are deferred until real referent binding lands.
+    // parse as supported while mutating the wrong object.
     let after_subject = [
         "~ ",
         "this creature ",
@@ -6713,17 +6802,12 @@ fn try_parse_perpetual_base_pt(tp: TextPair) -> Option<Effect> {
     let (rest, _) = tag::<_, _, OracleError<'_>>("base power and toughness ")
         .parse(rest)
         .ok()?;
-    let (rest, power) = nom_primitives::parse_number(rest).ok()?;
-    let (rest, _) = tag::<_, _, OracleError<'_>>("/").parse(rest).ok()?;
-    let (rest, toughness) = nom_primitives::parse_number(rest).ok()?;
-    if !(rest.is_empty() || rest == ".") {
-        return None;
-    }
+    let (power, toughness, _) = parse_base_pt_values(rest)?;
     Some(Effect::ApplyPerpetual {
         target: TargetFilter::Any,
         modification: crate::types::ability::PerpetualModification::SetBasePowerToughness {
-            power: power as i32,
-            toughness: toughness as i32,
+            power,
+            toughness,
         },
     })
 }
@@ -7672,6 +7756,33 @@ fn try_parse_skip_next_step(tp: TextPair, ctx: &ParseContext) -> Option<ParsedEf
         ))
         .parse(input)?;
         let (input, step) = parse_skip_step_name(input)?;
+        Ok((input, step))
+    }) {
+        if rest.trim().trim_end_matches('.').is_empty() {
+            return Some(parsed_clause(Effect::SkipNextStep {
+                target: TargetFilter::Controller,
+                step,
+                count: QuantityExpr::Fixed { value: 1 },
+                scope: SkipScope::NextOccurrence,
+            }));
+        }
+    }
+
+    // CR 614.10 + CR 614.10a + CR 502.3: "Skip the [step] step of that turn" —
+    // the current-turn-anaphor sibling of the "skip your next [step] step" form
+    // above. Printed on extra-turn spells that take an extra turn, then skip a
+    // step of it (Savor the Moment, Time Bends to My Will: "Take an extra turn
+    // after this one. Skip the untap step of that turn."). "That turn" is the
+    // extra turn just created, which is the controller's next turn, so its
+    // untap step is exactly the next occurrence of that step for the controller
+    // (CR 614.10a: a skip waits for the first occurrence that isn't skipped).
+    // The subject is elided to the resolving controller. Lowers to the same
+    // `SkipNextStep { NextOccurrence }` the "skip your next [step] step" sibling
+    // produces — no new effect or scope is required.
+    if let Some((step, rest)) = nom_on_lower(tp.original, tp.lower, |input| {
+        let (input, _) = tag::<_, _, OracleError<'_>>("skip the ").parse(input)?;
+        let (input, step) = parse_skip_step_name(input)?;
+        let (input, _) = tag(" of that turn").parse(input)?;
         Ok((input, step))
     }) {
         if rest.trim().trim_end_matches('.').is_empty() {
@@ -11290,6 +11401,7 @@ fn lower_imperative_clause(text: &str, ctx: &mut ParseContext) -> ParsedEffectCl
             return parsed_clause(Effect::GenericEffect {
                 static_abilities: vec![StaticDefinition::new(StaticMode::SpendManaAsAnyColor {
                     spell_filter: None,
+                    activation_source_filter: None,
                 })
                 .description(text.to_string())],
                 duration: None,
@@ -11648,6 +11760,35 @@ fn try_parse_verb_and_target<'a>(
         value((), alt((tag("exile all "), tag("exile each ")))).parse(i)
     }) {
         let rest_lower = &lower[lower.len() - rest.len()..];
+        // CR 400.3 + CR 404.1 + CR 406.2 + CR 108.2: "exile all cards from <possessive> <zone>
+        // and <zone>" (Identity Crisis) is a *union* of origin zones, not a
+        // compound of two effects. This is `try_split_targeted_compound`'s
+        // remainder probe: the generic parse below would leave " and <graveyard>"
+        // as the remainder, and the caller would mis-split it into an orphaned
+        // "graveyard" conjunct. Claiming the whole clause here (empty remainder)
+        // keeps it single — the actual `ChangeZoneAll { InAnyZone }` is built by
+        // `parse_exile_ast`, which mirrors this recognizer.
+        if let Some((owner, zones)) = imperative::try_parse_multi_zone_player_exile(rest_lower) {
+            return Some((
+                TargetedImperativeAst::ZoneCounterProxy(Box::new(
+                    ZoneCounterImperativeAst::Exile {
+                        origin: None,
+                        target: TargetFilter::Typed(
+                            crate::types::ability::TypedFilter::default()
+                                .controller(owner)
+                                .properties(vec![crate::types::ability::FilterProp::InAnyZone {
+                                    zones,
+                                }]),
+                        ),
+                        all: true,
+                        enter_with_counters: vec![],
+                    },
+                )),
+                // The matcher only claims a fully-consumed clause (trailing text
+                // is rejected), so there is no compound remainder to thread on.
+                "",
+            ));
+        }
         let (parsed_target, rem) = parse_target_with_ctx(rest, ctx);
         // CR 701.5a: "exile all spells" must constrain to the stack.
         let target = if scan_contains_phrase(rest_lower, "spell") {
@@ -11716,7 +11857,7 @@ fn try_parse_verb_and_target<'a>(
             parsed_target
         };
         let unless_pay = parse_unless_payment(rest_lower).map(counter_unless_pay_modifier);
-        if unless_pay.is_none() && scan_contains_phrase(rest_lower, "unless") {
+        if unless_pay.is_none() && has_unless_clause(rest_lower) {
             return None;
         }
         return Some((
@@ -11754,7 +11895,7 @@ fn try_parse_verb_and_target<'a>(
         };
         // CR 118.12: Parse "unless its controller pays {X}" for conditional counters
         let unless_pay = parse_unless_payment(rest_lower).map(counter_unless_pay_modifier);
-        if unless_pay.is_none() && scan_contains_phrase(rest_lower, "unless") {
+        if unless_pay.is_none() && has_unless_clause(rest_lower) {
             return None;
         }
         return Some((
@@ -12024,20 +12165,26 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
         }
     }
 
-    // CR 608.2c: Verb carry-forward for bare "target X" clauses in compound actions.
-    // When the sub-text starts with "target" and parsed as Unimplemented or
-    // the structural TargetOnly wrapper, prepend the verb from the primary
-    // effect and re-parse. Handles "exile target creature and target artifact"
-    // where "target artifact" lacks a verb.
-    // Only this branch accepts TargetOnly: bare "target ..." is the only
-    // verbless head that lowers structurally to TargetOnly; the other
-    // carry-forward prefixes below ("up to", "all/each", "~", possessives)
-    // fall back as Unimplemented when the verb is omitted.
+    // CR 608.2c: Verb carry-forward for bare "target X" / "another target X"
+    // clauses in compound actions. When the sub-text starts with "target" or
+    // "another target" and parsed as Unimplemented or the structural TargetOnly
+    // wrapper, prepend the verb from the primary effect and re-parse. Handles
+    // "exile target creature and target artifact" and "Return ~ and another
+    // target creature to their owners' hands" (Coastal Wizard, Lady Sun), where
+    // the trailing conjunct lacks a verb. "another target creature" is a
+    // standard target (CR 115.1 + FilterProp::Another; ~249 cards already use it).
+    // Only this branch accepts TargetOnly: a bare "target ..." / "another
+    // target ..." is the only verbless head that lowers structurally to
+    // TargetOnly; the other carry-forward prefixes below ("up to", "all/each",
+    // "~", possessives) fall back as Unimplemented when the verb is omitted.
     if (matches!(sub_clause.effect, Effect::Unimplemented { .. })
         || matches!(sub_clause.effect, Effect::TargetOnly { .. }))
-        && tag::<_, _, OracleError<'_>>("target ")
-            .parse(sub_lower.as_str())
-            .is_ok()
+        && alt((
+            tag::<_, _, OracleError<'_>>("target "),
+            tag("another target "),
+        ))
+        .parse(sub_lower.as_str())
+        .is_ok()
     {
         if let Some(verb) = extract_effect_verb(&primary_effect) {
             let reparsed_text = format!("{verb} {sub_text}");
@@ -17243,7 +17390,7 @@ fn rewrite_filter_keyword(filter: &mut TargetFilter, new_keyword: &Keyword) {
 }
 
 /// Swap the granted keyword inside a `StaticCondition` to `new_keyword`.
-fn rewrite_condition_keyword(condition: &mut StaticCondition, new_keyword: &Keyword) {
+pub(crate) fn rewrite_condition_keyword(condition: &mut StaticCondition, new_keyword: &Keyword) {
     match condition {
         StaticCondition::IsPresent {
             filter: Some(filter),
@@ -21461,7 +21608,7 @@ pub(crate) fn parse_effect_chain_ir(
             && cast_from_zone.is_none()
             && card_type_cond.is_none()
         {
-            strip_property_conditional(&text)
+            strip_property_conditional(&text, ctx)
         } else {
             (None, text)
         };
@@ -21647,6 +21794,8 @@ pub(crate) fn parse_effect_chain_ir(
         }
         let (is_optional, opponent_may_scope, implicit_player_scope, text) =
             strip_optional_effect_prefix(&text);
+        let retained_you_may_retarget_optional =
+            !is_optional && starts_with_you_may_choose_new_targets(&text);
         let (unless_same_name_condition, text) = if is_optional {
             if let Some((stripped, unless_cond)) =
                 crate::parser::oracle_effect::conditions::strip_unless_shares_name_with_other_exiled_this_way(
@@ -22390,6 +22539,16 @@ pub(crate) fn parse_effect_chain_ir(
             Effect::ChooseFromZone { zone, .. } => Some(*zone),
             _ => None,
         };
+        // CR 608.2d + CR 115.7d: The chunk loop intentionally keeps the full
+        // `you may choose new targets ...` surface form so the retarget parser
+        // can distinguish true ChangeTargets clauses from copy-retarget riders.
+        // Once that full-surface clause has actually parsed as ChangeTargets,
+        // carry the retained "you may" modal onto the ability.
+        if retained_you_may_retarget_optional
+            && matches!(clause.effect, Effect::ChangeTargets { .. })
+        {
+            clause.optional = true;
+        }
         if let Some(target) = &for_each_reference_target {
             bind_search_library_for_each_antecedent(&mut clause.effect, target, &text_no_qty_lower);
         }
@@ -23759,6 +23918,12 @@ pub(super) fn parse_unless_payment(lower: &str) -> Option<AbilityCost> {
         if let Some(cost) = parse_unless_mana_or_energy_payment(cost_str) {
             return Some(cost);
         }
+        if tag::<_, _, OracleError<'_>>("{")
+            .parse(cost_str.trim_start())
+            .is_ok()
+        {
+            return None;
+        }
     }
     // CR 118.12a: "unless [target's controller] has [~] deal N damage to them"
     // (Molten Influence and other counter spells with damage alternatives).
@@ -23786,20 +23951,13 @@ pub(super) fn parse_unless_payment(lower: &str) -> Option<AbilityCost> {
 /// the "pays " verb. Returns `None` for non-mana shapes (life / sacrifice /
 /// discard), which the caller routes to the shared non-mana authority.
 fn parse_unless_mana_or_energy_payment(cost_str: &str) -> Option<AbilityCost> {
+    let cost_str = cost_str.trim_start();
     // CR 107.14 + CR 202.3: dynamic energy unless-cost — checked before the
     // brace-run truncation below, which collapses "an amount of {e} …" to "an".
     if let Some(amount) = parse_dynamic_energy_unless_cost(cost_str) {
         return Some(AbilityCost::PayEnergy { amount });
     }
-    // Extract the mana cost (brace-delimited symbols)
-    let cost_end = cost_str
-        .find(|c: char| c != '{' && c != '}' && !c.is_alphanumeric())
-        .unwrap_or(cost_str.len());
-    let cost_text = cost_str[..cost_end].trim();
-    if cost_text.is_empty() || !cost_text.contains('{') {
-        return None;
-    }
-    if let Some((amount, rest)) = parse_fixed_energy_unless_cost(cost_text) {
+    if let Some((amount, rest)) = parse_fixed_energy_unless_cost(cost_str) {
         if rest.trim().is_empty() {
             return Some(AbilityCost::PayEnergy {
                 amount: QuantityExpr::Fixed {
@@ -23809,35 +23967,57 @@ fn parse_unless_mana_or_energy_payment(cost_str: &str) -> Option<AbilityCost> {
         }
     }
     // Check for dynamic {X} with "where X is" clause
-    if cost_text == "{X}" || cost_text == "{x}" {
-        let after_cost = &cost_str[cost_end..];
-        if let Some(quantity) = parse_where_x_is(after_cost) {
-            return Some(AbilityCost::ManaDynamic { quantity });
-        }
-        if tag::<_, _, OracleError<'_>>("where x is ")
-            .parse(after_cost.trim().trim_start_matches(',').trim())
-            .is_ok()
+    if let Ok((after_cost, _)) = tag::<_, _, OracleError<'_>>("{x}").parse(cost_str) {
+        if tag::<_, _, OracleError<'_>>("{")
+            .parse(after_cost.trim_start())
+            .is_err()
         {
-            return None;
-        }
-        // CR 107.3a + CR 118.12: bare {X} unless-cost references the announced X
-        // of the spell carrying this counter.
-        return Some(AbilityCost::ManaDynamic {
-            quantity: QuantityExpr::Ref {
-                qty: QuantityRef::Variable {
-                    name: "X".to_string(),
+            if let Some(quantity) = parse_where_x_is(after_cost) {
+                return Some(AbilityCost::ManaDynamic { quantity });
+            }
+            if tag::<_, _, OracleError<'_>>("where x is ")
+                .parse(after_cost.trim().trim_start_matches(',').trim())
+                .is_ok()
+            {
+                return None;
+            }
+            // CR 107.3a + CR 118.12: bare {X} unless-cost references the announced X
+            // of the spell carrying this counter.
+            return Some(AbilityCost::ManaDynamic {
+                quantity: QuantityExpr::Ref {
+                    qty: QuantityRef::Variable {
+                        name: "X".to_string(),
+                    },
                 },
-            },
-        });
+            });
+        }
     }
-    let cost = parse_mtgjson_mana_cost(cost_text);
-    if let Some(unless_cost) = parse_unless_for_each_payment(&cost_str[cost_end..], &cost) {
+    let (cost, after_cost) = parse_unless_mana_cost_prefix(cost_str)?;
+    if let Some(unless_cost) = parse_unless_for_each_payment(after_cost, &cost) {
         return Some(unless_cost);
     }
     if cost == ManaCost::NoCost || cost == ManaCost::zero() {
         return None;
     }
     Some(AbilityCost::Mana { cost })
+}
+
+pub(crate) fn parse_unless_mana_cost_prefix(input: &str) -> Option<(ManaCost, &str)> {
+    let input = input.trim_start();
+    // Oracle text is lowercased before these unless-cost paths, while mana
+    // symbol parsing is case-sensitive. ASCII uppercasing preserves byte length,
+    // so the consumed prefix still maps back onto the original input slice.
+    let normalized = input.to_ascii_uppercase();
+    let (normalized_rest, cost) = nom_primitives::parse_mana_cost(&normalized).ok()?;
+    let consumed = normalized.len().checked_sub(normalized_rest.len())?;
+    let rest = &input[consumed..];
+    if tag::<_, _, OracleError<'_>>("{")
+        .parse(rest.trim_start())
+        .is_ok()
+    {
+        return None;
+    }
+    Some((cost, rest))
 }
 
 /// Winternight Stories shape: primary Discard with "unless you discard a [type]"
@@ -24161,20 +24341,22 @@ fn parse_resolution_unless_cost(cost_text: &str) -> Option<AbilityCost> {
     // CR 107.3a: extract_resolution_unless_pay_modifier lowercased the text; the
     // case-sensitive X mana symbol no longer matches, so handle bare {x}
     // explicitly. The announced X of the carrying effect drives the cost.
-    if tag::<_, _, OracleError<'_>>("{x}")
-        .parse(cost_text.trim_start())
-        .is_ok()
-    {
-        return Some(AbilityCost::ManaDynamic {
-            quantity: QuantityExpr::Ref {
-                qty: QuantityRef::Variable {
-                    name: "X".to_string(),
+    if let Ok((after_cost, _)) = tag::<_, _, OracleError<'_>>("{x}").parse(cost_text.trim_start()) {
+        if tag::<_, _, OracleError<'_>>("{")
+            .parse(after_cost.trim_start())
+            .is_err()
+        {
+            return Some(AbilityCost::ManaDynamic {
+                quantity: QuantityExpr::Ref {
+                    qty: QuantityRef::Variable {
+                        name: "X".to_string(),
+                    },
                 },
-            },
-        });
+            });
+        }
     }
 
-    if let Ok((rest, cost)) = nom_primitives::parse_mana_cost(cost_text.trim_start()) {
+    if let Some((cost, rest)) = parse_unless_mana_cost_prefix(cost_text) {
         if let Some(unless_cost) = parse_unless_for_each_payment(rest, &cost) {
             return Some(unless_cost);
         }
@@ -24599,6 +24781,24 @@ fn constrain_filter_to_stack(filter: TargetFilter) -> TargetFilter {
 /// - "you may choose new targets for [spell phrase]" → scope: `All` (CR 115.7d)
 ///
 /// An optional trailing "to [target phrase]" sets `forced_to`.
+fn starts_with_you_may_choose_new_targets(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    nom_on_lower(text, &lower, |input| {
+        value(
+            (),
+            (
+                tag::<_, _, OracleError<'_>>("you may "),
+                alt((
+                    tag("choose new targets for "),
+                    tag("choose new target for "),
+                )),
+            ),
+        )
+        .parse(input)
+    })
+    .is_some()
+}
+
 fn try_parse_change_targets(lower: &str) -> Option<Effect> {
     type E<'a> = OracleError<'a>;
 
@@ -24609,8 +24809,8 @@ fn try_parse_change_targets(lower: &str) -> Option<Effect> {
         ),
         value(RetargetScope::Single, tag("change a target of ")),
         value(RetargetScope::All, tag("you may choose new targets for ")),
-        // Peeled form when `strip_optional_effect_prefix` correctly declined to
-        // strip a specialized "you may choose new targets" retarget clause.
+        // Peeled form for call sites that have already recorded the governing
+        // "you may" modal before dispatching the retarget body.
         value(RetargetScope::All, tag("choose new targets for ")),
     ))
     .parse(lower)

@@ -28,6 +28,7 @@ use super::match_config::{MatchConfig, MatchPhase, MatchScore};
 use super::phase::Phase;
 use super::player::{Player, PlayerCounterKind, PlayerId};
 use super::proposed_event::{CopyTokenSpec, ProposedEvent, ReplacementId, TokenSpec};
+use super::replacements::ReplacementEvent;
 use super::zones::EtbTapState;
 use super::zones::{ExileCostSourceZone, Zone};
 
@@ -2484,6 +2485,22 @@ pub struct PendingTriggerSummary {
     pub description: String,
 }
 
+/// CR 616.1 / CR 614: Display payload for one replacement-effect option — either
+/// one candidate in a CR 616.1 ordering prompt, or one branch (accept/decline)
+/// of an optional "you may" replacement. Engine-derived so the filtered state
+/// snapshot (multiplayer) and the frontend `ReplacementModal` never re-derive
+/// the source object/description from `state.objects`, exactly as
+/// [`PendingTriggerSummary`] does for CR 603.3b trigger ordering. For the
+/// optional case both branches carry the same `source_id` (one object, two
+/// outcomes); rule-based virtual replacements (shield counter, Umbra armor,
+/// Compleated, combat skip) still point at the object they act on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacementCandidateSummary {
+    pub source_id: ObjectId,
+    pub source_name: String,
+    pub description: String,
+}
+
 /// CR 603.3b: One controller's group within an in-flight trigger ordering
 /// pass. `ordered = true` once the controller has submitted their permutation
 /// (or once the group is single-trigger and trivially in final order, or once
@@ -3086,7 +3103,7 @@ pub enum WaitingFor {
         player: PlayerId,
         candidate_count: usize,
         #[serde(default)]
-        candidate_descriptions: Vec<String>,
+        candidates: Vec<ReplacementCandidateSummary>,
     },
     /// CR 603.3b: When a player controls 2+ triggered abilities placed on the
     /// stack in the same pass, that player chooses the order. The variant is
@@ -5717,6 +5734,41 @@ pub struct TriggerIndex {
     pub unclassified: smallvec::SmallVec<[ObjectId; 4]>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplacementIndexEntry {
+    pub id: ReplacementId,
+    pub ordinal: usize,
+}
+
+/// CR 614.1: Derived candidate pre-filter for replacement effects. The index is
+/// an optional acceleration over the legacy active-replacement scan: it stores
+/// only `ReplacementId`s plus their legacy scan ordinal, never replacement
+/// definitions, so consults re-read live object state and preserve CR 616 order.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReplacementIndex {
+    pub initialized: bool,
+    pub dirty: bool,
+    pub pipeline_active: bool,
+    pub by_event: im::HashMap<ReplacementEvent, im::Vector<ReplacementIndexEntry>>,
+}
+
+impl Default for ReplacementIndex {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            dirty: true,
+            pipeline_active: false,
+            by_event: im::HashMap::new(),
+        }
+    }
+}
+
+impl Clone for ReplacementIndex {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
 /// CR 611.2 + CR 613.1: Candidate pre-filter for `for_each_static_effect_source`.
 /// Holds the ids of objects that GENERATE ≥1 continuous effect for the TWO
 /// `layers_dirty`-covered source categories: battlefield permanents with a
@@ -5961,6 +6013,13 @@ pub struct GameState {
     /// `trigger_definitions` whenever needed.
     #[serde(skip)]
     pub trigger_index: TriggerIndex,
+    /// CR 614.1: Derived replacement-effect candidate index. Rebuilt from the
+    /// legacy `active_replacements(state)` order before replacement pipeline
+    /// entry, invalidated after every applied replacement, and ignored whenever
+    /// dirty/uninitialized. `#[serde(skip, default)]` because it is pure derived
+    /// acceleration and must not affect equality or serialized state.
+    #[serde(skip, default)]
+    pub replacement_index: ReplacementIndex,
     /// CR 611.2 + CR 613.1: Derived generator index for the layer gather.
     /// `#[serde(skip)]` derived state (like `trigger_index`/`layers_dirty`);
     /// reconstructed from `state.battlefield` + `state.command_zone` +
@@ -7461,10 +7520,10 @@ pub struct PendingReplacement {
 /// and addressed by the replacement pipeline via `ReplacementId { source:
 /// ObjectId(0), index }`.
 ///
-/// `description` is the player-facing string surfaced in `WaitingFor::
-/// ReplacementChoice::candidate_descriptions` when multiple handlers apply to
-/// the same emptying event and CR 616.1 requires the affected player to choose
-/// ordering.
+/// `description` (paired with `source`) is surfaced as a
+/// `ReplacementCandidateSummary` in `WaitingFor::ReplacementChoice::candidates`
+/// when multiple handlers apply to the same emptying event and CR 616.1
+/// requires the affected player to choose ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepEndManaScanEntry {
     pub source: ObjectId,
@@ -7829,6 +7888,7 @@ impl GameState {
             layers_dirty: LayersDirty::full(),
             static_gate_truth: im::HashMap::new(),
             trigger_index: TriggerIndex::default(),
+            replacement_index: ReplacementIndex::default(),
             static_source_index: StaticSourceIndex::default(),
             loop_detect_ring: std::collections::VecDeque::new(),
             next_timestamp: 1,
@@ -9124,7 +9184,7 @@ mod tests {
         variants.push(Box::new(WaitingFor::ReplacementChoice {
             player: PlayerId(0),
             candidate_count: 2,
-            candidate_descriptions: vec![],
+            candidates: vec![],
         }));
         variants.push(Box::new(WaitingFor::ExploreChoice {
             player: PlayerId(0),

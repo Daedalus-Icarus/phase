@@ -1142,6 +1142,7 @@ pub(crate) fn handle_discard_for_cost(
 
     // CR 601.2h + CR 616.1: Discard each chosen card through the replacement pipeline
     // so Madness (CR 702.35) etc. can intercept.
+    let cost_event_start = events.len();
     for (index, &card_id) in chosen.iter().enumerate() {
         match super::effects::discard::discard_as_cost(state, card_id, player, events) {
             super::effects::discard::DiscardOutcome::Complete => {}
@@ -1153,23 +1154,89 @@ pub(crate) fn handle_discard_for_cost(
                     paused_at_index: index,
                 });
                 super::casting::pause_cost_payment_for_replacement_choice(state, choice_player);
-                return Ok(state.waiting_for.clone());
+                // CR 603.2 + CR 603.3b: Earlier cards in a count>1 discard cost may
+                // already have emitted graveyard `ZoneChanged` events before this
+                // replacement pause. Park them now — the post-action pipeline will
+                // not run over this action's `events` (engine.rs gates on Priority).
+                let waiting_for = state.waiting_for.clone();
+                park_discard_for_cost_triggers_if_paused(
+                    state,
+                    events,
+                    cost_event_start,
+                    events.len(),
+                    &waiting_for,
+                );
+                return Ok(waiting_for);
             }
         }
     }
+    let cost_event_end = events.len();
 
-    finish_pending_cost_or_cast(state, player, pending, events)
+    let waiting_for = finish_pending_cost_or_cast(state, player, pending, events)?;
+
+    // CR 603.2 + CR 603.3b: When `finish_pending_cost_or_cast` lands on `Priority`
+    // the cast completed in THIS action, so `run_post_action_pipeline` will scan
+    // `events` (including the cost-discard `ZoneChanged` records above) and
+    // graveyard-entry observers fire normally.
+    //
+    // But when the cast PAUSES on a later mana-payment / target / modal choice
+    // (a non-`Priority` `WaitingFor`), `apply_action` does NOT run the
+    // post-action pipeline over this action's `events` (engine.rs gates the
+    // pipeline on `WaitingFor::Priority`), and the cast lands in a LATER
+    // action whose fresh `events` vector no longer carries these records — so
+    // a "whenever one or more creature cards are put into your graveyard"
+    // observer (Sefris of the Hidden Ways) would under-observe a discard paid
+    // before the remaining mana leg. Mirror the established B2 parking pattern
+    // used by `handle_sacrifice_for_cost`.
+    park_discard_for_cost_triggers_if_paused(
+        state,
+        events,
+        cost_event_start,
+        cost_event_end,
+        &waiting_for,
+    );
+
+    Ok(waiting_for)
+}
+
+/// CR 603.2 + CR 603.3b: When discard-for-cost emits graveyard `ZoneChanged`
+/// events but `finish_pending_cost_or_cast` lands on a non-`Priority`
+/// `WaitingFor`, park those events into `deferred_triggers` so
+/// `run_post_action_pipeline` does not drop them on the next action boundary
+/// (engine.rs gates the pipeline on `WaitingFor::Priority`). Mirrors
+/// `handle_sacrifice_for_cost`.
+fn park_discard_for_cost_triggers_if_paused(
+    state: &mut GameState,
+    events: &[GameEvent],
+    cost_event_start: usize,
+    cost_event_end: usize,
+    waiting_for: &WaitingFor,
+) {
+    if !matches!(waiting_for, WaitingFor::Priority { .. }) {
+        let cost_events: Vec<GameEvent> = events[cost_event_start..cost_event_end]
+            .iter()
+            .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
+            .cloned()
+            .collect();
+        crate::game::triggers::collect_triggers_into_deferred(state, &cost_events);
+    }
 }
 
 /// CR 601.2h + CR 616.1: After a replacement choice during discard-for-cost payment, finish
 /// discarding any remaining cards and continue the cast/activation pipeline.
+///
+/// `replacement_action_cost_event_start`, when set, is the `events` index at the
+/// start of the `ChooseReplacement` action that delivered the paused discard;
+/// it must include the replacement-resolved discard `ZoneChanged` record(s).
 pub(crate) fn resume_interrupted_cost_payment(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
+    replacement_action_cost_event_start: Option<usize>,
 ) -> Result<WaitingFor, EngineError> {
     if let Some(resume) = state.pending_discard_for_cost.take() {
         let player = resume.player;
         let pending = resume.pending;
+        let cost_event_start = replacement_action_cost_event_start.unwrap_or(events.len());
         for &card_id in resume.chosen.iter().skip(resume.paused_at_index + 1) {
             match super::effects::discard::discard_as_cost(state, card_id, player, events) {
                 super::effects::discard::DiscardOutcome::Complete => {}
@@ -1186,11 +1253,32 @@ pub(crate) fn resume_interrupted_cost_payment(
                         paused_at_index,
                     });
                     super::casting::pause_cost_payment_for_replacement_choice(state, choice_player);
-                    return Ok(state.waiting_for.clone());
+                    // CR 603.2 + CR 603.3b: Same mid-loop replacement pause as
+                    // `handle_discard_for_cost` — park already-emitted discard
+                    // cost events (including replacement-delivered discards in
+                    // this action) before the non-Priority action boundary.
+                    let waiting_for = state.waiting_for.clone();
+                    park_discard_for_cost_triggers_if_paused(
+                        state,
+                        events,
+                        cost_event_start,
+                        events.len(),
+                        &waiting_for,
+                    );
+                    return Ok(waiting_for);
                 }
             }
         }
-        return finish_pending_cost_or_cast(state, player, pending, events);
+        let cost_event_end = events.len();
+        let waiting_for = finish_pending_cost_or_cast(state, player, pending, events)?;
+        park_discard_for_cost_triggers_if_paused(
+            state,
+            events,
+            cost_event_start,
+            cost_event_end,
+            &waiting_for,
+        );
+        return Ok(waiting_for);
     }
 
     let Some(pending) = state.pending_cast.take() else {
@@ -1254,7 +1342,13 @@ pub(crate) fn handle_activation_cost_one_of_choice(
     }
 
     let chosen_cost = &costs[index];
-    if !chosen_cost.is_payable(state, player, pending.object_id) {
+    if !super::casting::can_pay_ability_cost_now(
+        state,
+        player,
+        pending.object_id,
+        chosen_cost,
+        pending.ability.context.ability_tag,
+    ) {
         return Err(EngineError::ActionNotAllowed(
             "Chosen cost branch is not payable".to_string(),
         ));
@@ -1268,6 +1362,37 @@ pub(crate) fn handle_activation_cost_one_of_choice(
         return Err(EngineError::InvalidAction(
             "Pending activation cost no longer has a OneOf branch".to_string(),
         ));
+    }
+
+    // CR 118.12a: `handle_activate_ability` routes bare discard legs through
+    // `WaitingFor::PayCost` before the OneOf gate; mirror that detour here after
+    // the branch is chosen so discard payment is not a silent activation no-op.
+    if let Some(ref cost) = pending.activation_cost {
+        if let Some((count, filter)) = super::casting::find_non_self_discard(cost) {
+            let count = super::quantity::resolve_quantity(state, count, player, pending.object_id)
+                .max(0) as usize;
+            let eligible = super::casting::find_eligible_discard_targets(
+                state,
+                player,
+                pending.object_id,
+                filter,
+            );
+            if eligible.len() < count {
+                return Err(EngineError::ActionNotAllowed(
+                    "Not enough cards in hand to discard".into(),
+                ));
+            }
+            return Ok(WaitingFor::PayCost {
+                player,
+                kind: PayCostKind::Discard,
+                choices: eligible,
+                count,
+                min_count: 0,
+                resume: CostResume::Spell {
+                    spell: Box::new(pending),
+                },
+            });
+        }
     }
 
     finish_pending_cost_or_cast(state, player, pending, events)
@@ -6625,6 +6750,7 @@ pub(super) fn auto_tap_mana_sources_excluding(
         excluded_sources,
         None,
         None,
+        None,
     );
 }
 
@@ -6665,65 +6791,74 @@ pub(super) fn auto_tap_mana_sources_with_context_excluding(
         excluded_sources,
         payment_context,
         None,
+        None,
     );
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct AutoTapSourceCache {
+    player: PlayerId,
+    sources: Vec<ManaSourceOption>,
+}
+
+impl AutoTapSourceCache {
+    fn sources(&self) -> &[ManaSourceOption] {
+        &self.sources
+    }
+
+    fn is_for_player(&self, player: PlayerId) -> bool {
+        self.player == player
+    }
+
+    pub(super) fn contains_source(&self, source_id: ObjectId) -> bool {
+        self.sources
+            .iter()
+            .any(|option| option.object_id == source_id)
+    }
+}
+
+pub(super) fn build_auto_tap_source_cache(
+    state: &GameState,
+    player: PlayerId,
+) -> AutoTapSourceCache {
+    crate::game::perf_counters::record_auto_tap_source_cache_build();
+    AutoTapSourceCache {
+        player,
+        sources: collect_sorted_auto_tap_source_options(state, player, None, &HashSet::new()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn auto_tap_mana_sources_inner(
+pub(super) fn auto_tap_mana_sources_with_context_excluding_cached(
     state: &mut GameState,
     player: PlayerId,
     cost: &crate::types::mana::ManaCost,
     events: &mut Vec<GameEvent>,
     deprioritize_source: Option<ObjectId>,
-    excluded_sources: &HashSet<ObjectId>,
     payment_context: Option<&PaymentContext<'_>>,
-    sub_cost_demand: Option<&crate::game::mana_payment::ColorDemand>,
+    excluded_sources: &HashSet<ObjectId>,
+    source_cache: Option<&AutoTapSourceCache>,
 ) {
-    use crate::types::card_type::CoreType;
-    use crate::types::mana::ManaCost;
-
-    // CR 601.2g: A player may spend mana from their mana pool to pay costs.
-    // Plan against the *residual* cost (what the pool can't already cover) so
-    // pre-floated mana isn't shadowed by redundant taps — e.g. Sol Ring + an
-    // Island floated before casting a 3-mana spell must not tap three more
-    // sources. Restriction-aware eligibility is delegated to
-    // `reduce_cost_by_pool`, which mirrors the real payment path.
-    let spell_meta =
-        deprioritize_source.and_then(|sid| super::casting::build_spell_meta(state, player, sid));
-    let spell_ctx = spell_meta.as_ref().map(PaymentContext::Spell);
-    let effective_ctx = payment_context.or(spell_ctx.as_ref());
-    let any_color = if matches!(
+    auto_tap_mana_sources_inner(
+        state,
+        player,
+        cost,
+        events,
+        deprioritize_source,
+        excluded_sources,
         payment_context,
-        Some(PaymentContext::Effect | PaymentContext::Activation { .. })
-    ) {
-        super::static_abilities::player_can_spend_as_any_color(state, player)
-    } else {
-        super::casting::player_can_spend_as_any_color_for_optional_spell(
-            state,
-            player,
-            deprioritize_source,
-        )
-    };
-    let residual = state
-        .players
-        .iter()
-        .find(|p| p.id == player)
-        .map(|p| {
-            mana_payment::reduce_cost_by_pool(
-                &p.mana_pool,
-                cost,
-                effective_ctx,
-                any_color,
-                sub_cost_demand,
-            )
-        })
-        .unwrap_or_else(|| cost.clone());
+        None,
+        source_cache,
+    );
+}
 
-    let (shards, generic) = match &residual {
-        ManaCost::NoCost | ManaCost::SelfManaCost | ManaCost::SelfManaValue => return,
-        ManaCost::Cost { shards, generic } if shards.is_empty() && *generic == 0 => return,
-        ManaCost::Cost { shards, generic } => (shards.as_slice(), *generic),
-    };
+fn collect_sorted_auto_tap_source_options(
+    state: &GameState,
+    player: PlayerId,
+    deprioritize_source: Option<ObjectId>,
+    excluded_sources: &HashSet<ObjectId>,
+) -> Vec<ManaSourceOption> {
+    use crate::types::card_type::CoreType;
 
     // Loop-invariant hoist: the TapsForMana trigger-source list is identical for
     // every land in this board-global sweep, so compute it once instead of
@@ -6812,6 +6947,103 @@ fn auto_tap_mana_sources_inner(
         )
     });
 
+    available
+}
+
+fn cached_auto_tap_sources<'a>(
+    source_cache: Option<&'a AutoTapSourceCache>,
+    player: PlayerId,
+    deprioritize_source: Option<ObjectId>,
+    excluded_sources: &HashSet<ObjectId>,
+    sub_cost_demand: Option<&crate::game::mana_payment::ColorDemand>,
+) -> Option<&'a [ManaSourceOption]> {
+    let cache = source_cache?;
+    if cache.is_for_player(player)
+        && excluded_sources.is_empty()
+        && sub_cost_demand.is_none()
+        && deprioritize_source.is_none_or(|source_id| !cache.contains_source(source_id))
+    {
+        crate::game::perf_counters::record_cached_auto_tap_source_reuse();
+        Some(cache.sources())
+    } else {
+        crate::game::perf_counters::record_cached_auto_tap_source_reject();
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn auto_tap_mana_sources_inner(
+    state: &mut GameState,
+    player: PlayerId,
+    cost: &crate::types::mana::ManaCost,
+    events: &mut Vec<GameEvent>,
+    deprioritize_source: Option<ObjectId>,
+    excluded_sources: &HashSet<ObjectId>,
+    payment_context: Option<&PaymentContext<'_>>,
+    sub_cost_demand: Option<&crate::game::mana_payment::ColorDemand>,
+    source_cache: Option<&AutoTapSourceCache>,
+) {
+    use crate::types::mana::ManaCost;
+
+    // CR 601.2g: A player may spend mana from their mana pool to pay costs.
+    // Plan against the *residual* cost (what the pool can't already cover) so
+    // pre-floated mana isn't shadowed by redundant taps — e.g. Sol Ring + an
+    // Island floated before casting a 3-mana spell must not tap three more
+    // sources. Restriction-aware eligibility is delegated to
+    // `reduce_cost_by_pool`, which mirrors the real payment path.
+    let spell_meta =
+        deprioritize_source.and_then(|sid| super::casting::build_spell_meta(state, player, sid));
+    let spell_ctx = spell_meta.as_ref().map(PaymentContext::Spell);
+    let effective_ctx = payment_context.or(spell_ctx.as_ref());
+    // CR 609.4b: Auto-tap planning must use the same spend-as-any-color authority
+    // as legality dry-runs and real payment (`player_can_spend_as_any_color_for_payment`),
+    // including activation-source-filtered grants (Agatha's Soul Cauldron class).
+    let any_color = super::casting::player_can_spend_as_any_color_for_payment(
+        state,
+        player,
+        deprioritize_source,
+        effective_ctx,
+    );
+    let residual = state
+        .players
+        .iter()
+        .find(|p| p.id == player)
+        .map(|p| {
+            mana_payment::reduce_cost_by_pool(
+                &p.mana_pool,
+                cost,
+                effective_ctx,
+                any_color,
+                sub_cost_demand,
+            )
+        })
+        .unwrap_or_else(|| cost.clone());
+
+    let (shards, generic) = match &residual {
+        ManaCost::NoCost | ManaCost::SelfManaCost | ManaCost::SelfManaValue => return,
+        ManaCost::Cost { shards, generic } if shards.is_empty() && *generic == 0 => return,
+        ManaCost::Cost { shards, generic } => (shards.as_slice(), *generic),
+    };
+
+    let available_buf;
+    let available: &[ManaSourceOption] = if let Some(cached) = cached_auto_tap_sources(
+        source_cache,
+        player,
+        deprioritize_source,
+        excluded_sources,
+        sub_cost_demand,
+    ) {
+        cached
+    } else {
+        available_buf = collect_sorted_auto_tap_source_options(
+            state,
+            player,
+            deprioritize_source,
+            excluded_sources,
+        );
+        &available_buf
+    };
+
     let mut to_tap: Vec<ManaSourceOption> = Vec::new();
     let mut used_sources: HashSet<ObjectId> = HashSet::new();
 
@@ -6885,7 +7117,7 @@ fn auto_tap_mana_sources_inner(
     // requirements. Pre-allocate combination sources against pairs of
     // still-unfilled shards before falling through to the single-color loop.
     assign_combination_sources(
-        &available,
+        available,
         &needs,
         &mut assigned,
         &mut used_sources,
@@ -6913,7 +7145,7 @@ fn auto_tap_mana_sources_inner(
                 continue;
             }
             let count = count_available_sources(
-                &available,
+                available,
                 &used_sources,
                 acceptable,
                 *requires_two_or_more_color_source,
@@ -6932,7 +7164,7 @@ fn auto_tap_mana_sources_inner(
         let (ref acceptable, two_generic_fallback, requires_two_or_more_color_source, _) =
             &needs[idx];
         if let Some(option) = find_least_flexible_source(
-            &available,
+            available,
             &used_sources,
             acceptable,
             *requires_two_or_more_color_source,
@@ -6984,7 +7216,7 @@ fn auto_tap_mana_sources_inner(
         if remaining_generic == 0 {
             break;
         }
-        for option in &available {
+        for option in available {
             if remaining_generic == 0 {
                 break;
             }
@@ -7088,6 +7320,7 @@ fn auto_tap_mana_sources_inner(
                         excluded,
                         Some(&activation_ctx),
                         demand.as_ref(),
+                        None,
                     );
                 }
                 // color_override tells resolve_mana_ability how to resolve the
@@ -8972,6 +9205,30 @@ mod tests {
                 ReplacementDefinition::new(ReplacementEvent::Discard)
                     .mode(ReplacementMode::Optional { decline: None })
                     .description("Apply discard replacement".to_string()),
+            );
+        replacement_source
+    }
+
+    fn install_land_only_discard_replacement(state: &mut GameState) -> ObjectId {
+        use crate::types::ability::{TargetFilter, TypedFilter};
+
+        let replacement_source = create_object(
+            state,
+            CardId(9_004),
+            PlayerId(0),
+            "Land Discard Replacement".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&replacement_source)
+            .unwrap()
+            .replacement_definitions
+            .push(
+                ReplacementDefinition::new(ReplacementEvent::Discard)
+                    .mode(ReplacementMode::Optional { decline: None })
+                    .valid_card(TargetFilter::Typed(TypedFilter::land()))
+                    .description("Apply land discard replacement".to_string()),
             );
         replacement_source
     }
@@ -11281,6 +11538,210 @@ mod tests {
         assert_eq!(state.stack.len(), 1, "activation should reach the stack");
     }
 
+    /// CR 603.2 + CR 603.3b: When a count>1 discard cost completes earlier
+    /// discards then pauses on a later card's replacement choice, already-emitted
+    /// graveyard-entry events must be parked before the non-Priority boundary.
+    #[test]
+    fn discard_for_cost_parks_triggers_when_later_discard_pauses_on_replacement() {
+        use crate::parser::oracle::parse_oracle_text;
+
+        let mut state = GameState::new_two_player(42);
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        install_land_only_discard_replacement(&mut state);
+
+        let source = create_object(
+            &mut state,
+            CardId(30),
+            PlayerId(0),
+            "Discard Outlet".to_string(),
+            Zone::Battlefield,
+        );
+
+        let creature = create_object(
+            &mut state,
+            CardId(31),
+            PlayerId(0),
+            "First Bear".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+        }
+
+        let land = create_object(
+            &mut state,
+            CardId(32),
+            PlayerId(0),
+            "Second Land".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&land).unwrap();
+            obj.card_types.core_types.push(CoreType::Land);
+        }
+
+        let sefris_doc = parse_oracle_text(
+            "Whenever one or more creature cards are put into your graveyard from anywhere, venture into the dungeon.",
+            "Sefris Observer",
+            &[],
+            &[],
+            &[],
+        );
+        let sefris_trigger = sefris_doc
+            .triggers
+            .into_iter()
+            .next()
+            .expect("Sefris trigger");
+
+        let observer = create_object(
+            &mut state,
+            CardId(33),
+            PlayerId(0),
+            "Sefris Observer".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&observer).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.entered_battlefield_turn = Some(1);
+            obj.trigger_definitions.push(sefris_trigger);
+            crate::game::trigger_index::reindex_object_triggers(&mut state, observer);
+        }
+
+        let mut events = Vec::new();
+        let waiting = handle_discard_for_cost(
+            &mut state,
+            PlayerId(0),
+            make_pending(source),
+            2,
+            &[creature, land],
+            &[creature, land],
+            &mut events,
+        )
+        .expect("land discard should pause for land-only replacement");
+
+        assert!(
+            matches!(waiting, WaitingFor::ReplacementChoice { .. }),
+            "expected ReplacementChoice on land discard, got {waiting:?}"
+        );
+        assert_eq!(state.objects[&creature].zone, Zone::Graveyard);
+        assert_eq!(state.objects[&land].zone, Zone::Hand);
+        assert!(
+            !state.deferred_triggers.is_empty(),
+            "earlier creature discard events must be parked when a later discard \
+             pauses on replacement choice"
+        );
+    }
+
+    /// CR 603.2 + CR 603.3b: Resume loop mid-discard replacement pause must park
+    /// discards already delivered in the same replacement action before the next
+    /// non-Priority boundary (second card's replacement choice in a 2-discard cost).
+    #[test]
+    fn discard_for_cost_resume_parks_triggers_when_next_discard_pauses_on_replacement() {
+        use crate::parser::oracle::parse_oracle_text;
+
+        let mut state = GameState::new_two_player(42);
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        install_optional_discard_replacement(&mut state);
+
+        let source = create_object(
+            &mut state,
+            CardId(30),
+            PlayerId(0),
+            "Discard Outlet".to_string(),
+            Zone::Battlefield,
+        );
+
+        let first_creature = create_object(
+            &mut state,
+            CardId(31),
+            PlayerId(0),
+            "First Bear".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&first_creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+        }
+
+        let second = create_object(
+            &mut state,
+            CardId(32),
+            PlayerId(0),
+            "Second Card".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&second).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+        }
+
+        let sefris_doc = parse_oracle_text(
+            "Whenever one or more creature cards are put into your graveyard from anywhere, venture into the dungeon.",
+            "Sefris Observer",
+            &[],
+            &[],
+            &[],
+        );
+        let sefris_trigger = sefris_doc
+            .triggers
+            .into_iter()
+            .next()
+            .expect("Sefris trigger");
+
+        let observer = create_object(
+            &mut state,
+            CardId(33),
+            PlayerId(0),
+            "Sefris Observer".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&observer).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.entered_battlefield_turn = Some(1);
+            obj.trigger_definitions.push(sefris_trigger);
+            crate::game::trigger_index::reindex_object_triggers(&mut state, observer);
+        }
+
+        let mut events = Vec::new();
+        handle_discard_for_cost(
+            &mut state,
+            PlayerId(0),
+            make_pending(source),
+            2,
+            &[first_creature, second],
+            &[first_creature, second],
+            &mut events,
+        )
+        .expect("first discard should pause for replacement choice");
+
+        apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 })
+            .expect("first replacement choice should resume to the second discard");
+
+        assert!(
+            matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+            "expected second ReplacementChoice, got {:?}",
+            state.waiting_for
+        );
+        assert_eq!(state.objects[&first_creature].zone, Zone::Graveyard);
+        assert_eq!(state.objects[&second].zone, Zone::Hand);
+        assert!(
+            !state.deferred_triggers.is_empty(),
+            "first creature discard must be parked when resume pauses on the second \
+             card's replacement choice"
+        );
+    }
+
     /// CR 603.6c + CR 118.3: Sacrificing a permanent as part of a cost is a
     /// game event that triggers other abilities (e.g., Crime Novelist's
     /// "whenever you sacrifice an artifact"). Regression: cost-payment
@@ -11403,6 +11864,209 @@ mod tests {
             "observer's `whenever you sacrifice an artifact` trigger must fire \
              when an artifact is sacrificed as part of an activated-ability cost"
         );
+    }
+
+    /// CR 603.2 + CR 603.3b: When discard-for-cost emits graveyard `ZoneChanged`
+    /// events but `finish_pending_cost_or_cast` lands on `ManaPayment`, the
+    /// post-action pipeline is skipped and observer triggers must be parked in
+    /// `deferred_triggers` (mirrors `handle_sacrifice_for_cost`). Regression for
+    /// Sefris + discard-before-mana activation costs (issue #4267).
+    #[test]
+    fn discard_for_cost_parks_graveyard_triggers_when_mana_payment_remains() {
+        use crate::parser::oracle::parse_oracle_text;
+        use crate::types::mana::{ManaCost, ManaCostShard};
+
+        let mut state = GameState::new_two_player(42);
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+
+        let source = create_object(
+            &mut state,
+            CardId(10),
+            PlayerId(0),
+            "Discard Outlet".to_string(),
+            Zone::Battlefield,
+        );
+
+        let hand_creature = create_object(
+            &mut state,
+            CardId(11),
+            PlayerId(0),
+            "Hand Bear".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&hand_creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+        }
+
+        let sefris_doc = parse_oracle_text(
+            "Whenever one or more creature cards are put into your graveyard from anywhere, venture into the dungeon.",
+            "Sefris Observer",
+            &[],
+            &[],
+            &[],
+        );
+        let sefris_trigger = sefris_doc
+            .triggers
+            .into_iter()
+            .next()
+            .expect("Sefris trigger");
+
+        let observer = create_object(
+            &mut state,
+            CardId(12),
+            PlayerId(0),
+            "Sefris Observer".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&observer).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.entered_battlefield_turn = Some(1);
+            obj.trigger_definitions.push(sefris_trigger);
+            crate::game::trigger_index::reindex_object_triggers(&mut state, observer);
+        }
+
+        let mut pending = make_pending(source);
+        pending.cost = ManaCost::Cost {
+            generic: 0,
+            shards: vec![ManaCostShard::Black],
+        };
+        pending.payment_mode = CastPaymentMode::Manual;
+        pending.activation_ability_index = Some(0);
+
+        let mut events = Vec::new();
+        let waiting = handle_discard_for_cost(
+            &mut state,
+            PlayerId(0),
+            pending,
+            1,
+            &[hand_creature],
+            &[hand_creature],
+            &mut events,
+        )
+        .expect("discard-for-cost should pause on remaining mana payment");
+
+        assert!(
+            matches!(waiting, WaitingFor::ManaPayment { .. }),
+            "expected ManaPayment after discard when {{B}} remains, got {waiting:?}"
+        );
+        assert!(
+            !state.deferred_triggers.is_empty(),
+            "graveyard-entry observer triggers must be parked when discard-for-cost \
+             pauses before Priority"
+        );
+        assert_eq!(state.objects[&hand_creature].zone, Zone::Graveyard);
+    }
+
+    /// CR 603.2 + CR 603.3b: Replacement-resumed discard-for-cost must park
+    /// observer triggers when the resume finishes on non-Priority (e.g. remaining
+    /// `{B}` mana payment). Regression for issue #4267 replacement path.
+    #[test]
+    fn replacement_resumed_discard_for_cost_parks_triggers_when_mana_payment_remains() {
+        use crate::parser::oracle::parse_oracle_text;
+        use crate::types::mana::{ManaCost, ManaCostShard};
+
+        let mut state = GameState::new_two_player(42);
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        install_optional_discard_replacement(&mut state);
+
+        let source = create_object(
+            &mut state,
+            CardId(10),
+            PlayerId(0),
+            "Discard Outlet".to_string(),
+            Zone::Battlefield,
+        );
+
+        let hand_creature = create_object(
+            &mut state,
+            CardId(11),
+            PlayerId(0),
+            "Hand Bear".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&hand_creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+        }
+
+        let sefris_doc = parse_oracle_text(
+            "Whenever one or more creature cards are put into your graveyard from anywhere, venture into the dungeon.",
+            "Sefris Observer",
+            &[],
+            &[],
+            &[],
+        );
+        let sefris_trigger = sefris_doc
+            .triggers
+            .into_iter()
+            .next()
+            .expect("Sefris trigger");
+
+        let observer = create_object(
+            &mut state,
+            CardId(12),
+            PlayerId(0),
+            "Sefris Observer".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&observer).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.entered_battlefield_turn = Some(1);
+            obj.trigger_definitions.push(sefris_trigger);
+            crate::game::trigger_index::reindex_object_triggers(&mut state, observer);
+        }
+
+        let mut pending = make_pending(source);
+        pending.cost = ManaCost::Cost {
+            generic: 0,
+            shards: vec![ManaCostShard::Black],
+        };
+        pending.payment_mode = CastPaymentMode::Manual;
+        pending.activation_ability_index = Some(0);
+
+        let mut events = Vec::new();
+        let waiting = handle_discard_for_cost(
+            &mut state,
+            PlayerId(0),
+            pending,
+            1,
+            &[hand_creature],
+            &[hand_creature],
+            &mut events,
+        )
+        .expect("discard-for-cost should pause for replacement choice");
+
+        assert!(
+            matches!(waiting, WaitingFor::ReplacementChoice { .. }),
+            "expected ReplacementChoice before resume, got {waiting:?}"
+        );
+        assert_eq!(state.objects[&hand_creature].zone, Zone::Hand);
+
+        apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 })
+            .expect("replacement choice should resume discard and pause on mana");
+
+        assert!(
+            matches!(state.waiting_for, WaitingFor::ManaPayment { .. }),
+            "expected ManaPayment after replacement-resumed discard, got {:?}",
+            state.waiting_for
+        );
+        assert!(
+            !state.deferred_triggers.is_empty(),
+            "replacement-resumed discard must park graveyard-entry triggers when \
+             finish lands on ManaPayment"
+        );
+        assert_eq!(state.objects[&hand_creature].zone, Zone::Graveyard);
     }
 
     /// CR 603.6c + CR 603.10a: Sacrificing an artifact TOKEN as a cost must

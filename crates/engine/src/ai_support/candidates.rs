@@ -688,8 +688,15 @@ pub fn candidate_actions_exact(state: &GameState) -> Vec<CandidateAction> {
 }
 
 pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
+    candidate_actions_broad_with_probe(state, None)
+}
+
+pub fn candidate_actions_broad_with_probe(
+    state: &GameState,
+    probe: Option<&casting::PriorityCastProbe>,
+) -> Vec<CandidateAction> {
     let actions = match &state.waiting_for {
-        WaitingFor::Priority { player } => priority_actions(state, *player),
+        WaitingFor::Priority { player } => priority_actions_with_probe(state, *player, probe),
         WaitingFor::ManaPayment {
             player,
             convoke_mode,
@@ -1403,6 +1410,7 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
             } else {
                 // CR 702.172b: For Spree spells, filter out mode combinations the player
                 // cannot afford. Each mode has an additional cost that sums with the base cost.
+                let local_probe = casting::PriorityCastProbe::new(state, *player);
                 actions
                     .into_iter()
                     .filter(|ca| {
@@ -1423,11 +1431,12 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
                             &pending_cast.cost,
                             &spree_total,
                         );
-                        casting::can_pay_cost_after_auto_tap(
-                            state,
+                        casting::can_pay_cost_after_auto_tap_with_probe(
+                            local_probe.state(),
                             *player,
                             pending_cast.object_id,
                             &total,
+                            Some(&local_probe),
                         )
                     })
                     .collect()
@@ -1437,6 +1446,7 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
             player,
             modal,
             unavailable_modes,
+            is_activated,
             ..
         } => {
             let available: Vec<usize> = (0..modal.mode_count)
@@ -1474,7 +1484,7 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
             // CR 700.2i: For pawprint points-budget modals, prune to budget-legal
             // mode sequences. Index the UNFILTERED `modal` (real indices
             // 0..mode_count). No-op for non-pawprint modals.
-            if modal.mode_pawprints.is_empty() {
+            let mut actions = if modal.mode_pawprints.is_empty() {
                 actions
             } else {
                 actions
@@ -1486,7 +1496,21 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
                         _ => true,
                     })
                     .collect()
+            };
+            // CR 602.2b: An activated modal ability can be cancelled at the mode-choice
+            // sub-step (see engine.rs). Surfacing CancelCast here feeds BOTH the AI search
+            // and the multiplayer exact-legal-actions gate (candidate_actions_broad flows
+            // through candidate_actions → validated_candidate_actions → flat_priority_actions
+            // → legal_actions_full), so a human in MP can submit cancel. Triggered modal
+            // abilities (CR 603.3c) must choose a mode — no cancel.
+            if *is_activated {
+                actions.push(candidate(
+                    GameAction::CancelCast,
+                    TacticalClass::Pass,
+                    Some(*player),
+                ));
             }
+            actions
         }
         WaitingFor::ConniveDiscard {
             player,
@@ -1737,7 +1761,15 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
         } => costs
             .iter()
             .enumerate()
-            .filter(|(_, cost)| cost.is_payable(state, *player, pending_cast.object_id))
+            .filter(|(_, cost)| {
+                casting::can_pay_ability_cost_now(
+                    state,
+                    *player,
+                    pending_cast.object_id,
+                    cost,
+                    pending_cast.ability.context.ability_tag,
+                )
+            })
             .map(|(i, _)| {
                 candidate(
                     GameAction::ChooseActivationCostBranch { index: i },
@@ -2775,8 +2807,15 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
 }
 
 pub fn candidate_actions(state: &GameState) -> Vec<CandidateAction> {
+    candidate_actions_with_probe(state, None)
+}
+
+pub fn candidate_actions_with_probe(
+    state: &GameState,
+    probe: Option<&casting::PriorityCastProbe>,
+) -> Vec<CandidateAction> {
     let mut actions = candidate_actions_exact(state);
-    actions.extend(candidate_actions_broad(state));
+    actions.extend(candidate_actions_broad_with_probe(state, probe));
 
     if state.waiting_for.has_pending_cast() {
         if let Some(player) = state.waiting_for.acting_player() {
@@ -2811,7 +2850,16 @@ fn candidate(
     }
 }
 
+#[cfg(test)]
 fn priority_actions(state: &GameState, player: PlayerId) -> Vec<CandidateAction> {
+    priority_actions_with_probe(state, player, None)
+}
+
+pub(crate) fn priority_actions_with_probe(
+    state: &GameState,
+    player: PlayerId,
+    probe: Option<&casting::PriorityCastProbe>,
+) -> Vec<CandidateAction> {
     let mut actions = vec![candidate(
         GameAction::PassPriority,
         TacticalClass::Pass,
@@ -2827,6 +2875,8 @@ fn priority_actions(state: &GameState, player: PlayerId) -> Vec<CandidateAction>
     let is_main_phase = matches!(state.phase, Phase::PreCombatMain | Phase::PostCombatMain);
     let stack_empty = state.stack.is_empty();
     let is_active = state.active_player == player;
+    let activation_restriction_gates =
+        crate::game::restrictions::ActivationRestrictionStaticGates::compute(state);
 
     if crate::game::planechase::can_roll_planar_die(state, player) {
         actions.push(candidate(
@@ -2917,7 +2967,7 @@ fn priority_actions(state: &GameState, player: PlayerId) -> Vec<CandidateAction>
             let Some(obj) = state.objects.get(&object_id) else {
                 continue;
             };
-            if casting::can_cast_object_now(state, player, object_id) {
+            if casting::can_cast_object_now_with_probe(state, player, object_id, probe) {
                 actions.push(candidate(
                     GameAction::CastSpell {
                         object_id,
@@ -2935,7 +2985,9 @@ fn priority_actions(state: &GameState, player: PlayerId) -> Vec<CandidateAction>
         // CR 601.2b + CR 118.9a: Opt-in CastFromHandFree once-per-turn candidates
         // (Zaffai and the Tempests). Each (hand spell, source) pair that passes the
         // filter AND hasn't had its slot consumed this turn yields one candidate.
-        for (object_id, source_id, _freq) in casting::hand_cast_free_candidates(state, player) {
+        for (object_id, source_id, _freq) in
+            casting::hand_cast_free_candidates_with_probe(state, player, probe)
+        {
             let Some(obj) = state.objects.get(&object_id) else {
                 continue;
             };
@@ -2959,7 +3011,13 @@ fn priority_actions(state: &GameState, player: PlayerId) -> Vec<CandidateAction>
                     for (i, ability_def) in casting::activated_ability_definitions(state, obj_id) {
                         if ability_def.kind == crate::types::ability::AbilityKind::Activated
                             && !crate::game::mana_abilities::is_mana_ability(&ability_def)
-                            && casting::can_activate_ability_now(state, player, obj_id, i)
+                            && casting::can_activate_ability_now_with_restriction_gates(
+                                state,
+                                player,
+                                obj_id,
+                                i,
+                                &activation_restriction_gates,
+                            )
                         {
                             actions.push(candidate(
                                 GameAction::ActivateAbility {
@@ -3007,7 +3065,13 @@ fn priority_actions(state: &GameState, player: PlayerId) -> Vec<CandidateAction>
                         {
                             if ability_def.kind == crate::types::ability::AbilityKind::Activated
                                 && !crate::game::mana_abilities::is_mana_ability(&ability_def)
-                                && casting::can_activate_ability_now(state, player, obj_id, i)
+                                && casting::can_activate_ability_now_with_restriction_gates(
+                                    state,
+                                    player,
+                                    obj_id,
+                                    i,
+                                    &activation_restriction_gates,
+                                )
                             {
                                 actions.push(candidate(
                                     GameAction::ActivateAbility {
@@ -3065,7 +3129,13 @@ fn priority_actions(state: &GameState, player: PlayerId) -> Vec<CandidateAction>
                         if ability_def.kind == crate::types::ability::AbilityKind::Activated
                             && ability_def.activation_zone == Some(crate::types::zones::Zone::Hand)
                             && !crate::game::mana_abilities::is_mana_ability(&ability_def)
-                            && casting::can_activate_ability_now(state, player, obj_id, i)
+                            && casting::can_activate_ability_now_with_restriction_gates(
+                                state,
+                                player,
+                                obj_id,
+                                i,
+                                &activation_restriction_gates,
+                            )
                         {
                             actions.push(candidate(
                                 GameAction::ActivateAbility {
@@ -3098,7 +3168,13 @@ fn priority_actions(state: &GameState, player: PlayerId) -> Vec<CandidateAction>
                             && ability_def.activation_zone
                                 == Some(crate::types::zones::Zone::Graveyard)
                             && !crate::game::mana_abilities::is_mana_ability(&ability_def)
-                            && casting::can_activate_ability_now(state, player, obj_id, i)
+                            && casting::can_activate_ability_now_with_restriction_gates(
+                                state,
+                                player,
+                                obj_id,
+                                i,
+                                &activation_restriction_gates,
+                            )
                         {
                             actions.push(candidate(
                                 GameAction::ActivateAbility {
@@ -3218,7 +3294,13 @@ fn priority_actions(state: &GameState, player: PlayerId) -> Vec<CandidateAction>
                 if ability_def.kind == crate::types::ability::AbilityKind::Activated
                     && ability_def.activation_zone == Some(crate::types::zones::Zone::Library)
                     && !crate::game::mana_abilities::is_mana_ability(&ability_def)
-                    && casting::can_activate_ability_now(state, player, top_id, i)
+                    && casting::can_activate_ability_now_with_restriction_gates(
+                        state,
+                        player,
+                        top_id,
+                        i,
+                        &activation_restriction_gates,
+                    )
                 {
                     actions.push(candidate(
                         GameAction::ActivateAbility {
