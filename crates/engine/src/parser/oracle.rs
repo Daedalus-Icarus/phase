@@ -90,7 +90,8 @@ use super::oracle_static::{
     parse_collect_evidence_alt_cost, parse_every_creature_type_static_prefix,
     parse_flashback_trailing_self_spell_cost_reduction, parse_spells_alternative_cost,
     parse_static_line, parse_static_line_multi, try_parse_graveyard_keyword_grant_clause,
-    try_parse_graveyard_keyword_grant_static, GraveyardGrantedKeywordKind,
+    try_parse_graveyard_keyword_grant_static, try_parse_top_of_library_cast_permission,
+    GrantedCastKeywordKind,
 };
 use super::oracle_trigger::{lower_trigger_ir, parse_trigger_lines_at_index};
 use super::oracle_util::{
@@ -641,7 +642,7 @@ fn parsed_result_recently_granted_flashback(result: &ParsedAbilities) -> bool {
 
 pub(crate) fn parse_graveyard_keyword_continuation(
     text: &str,
-    kind: GraveyardGrantedKeywordKind,
+    kind: GrantedCastKeywordKind,
 ) -> Option<Keyword> {
     fn continuation_fully_consumed(rest: &str) -> bool {
         rest.trim().trim_end_matches('.').trim().is_empty()
@@ -657,10 +658,39 @@ pub(crate) fn parse_graveyard_keyword_continuation(
         Some(rest)
     }
 
+    /// CR 601.2f: Parse an optional "reduced by {N}" suffix on a granted
+    /// "[keyword] cost is equal to its mana cost" continuation (Dream Devourer's
+    /// "reduced by {2}", Aminatou's "reduced by {4}"). Returns the GENERIC
+    /// component of the parsed cost as the reduction (colored pips in the
+    /// reduction phrase would be non-generic and ignored — real cards state
+    /// generic-only reductions), or `0` when the suffix is absent. The remaining
+    /// slice after the (optional) suffix is returned so the caller can enforce
+    /// `continuation_fully_consumed`.
+    fn parse_reduced_by_generic_suffix(text: &str) -> (u32, &str) {
+        let lower = text.to_lowercase();
+        nom_on_lower(text, &lower, |i| {
+            let (i, reduction) = opt(preceded(
+                (
+                    nom::character::complete::space0,
+                    tag("reduced by "),
+                    nom::character::complete::space0,
+                ),
+                super::oracle_nom::primitives::parse_mana_cost,
+            ))
+            .parse(i)?;
+            let generic = match reduction {
+                Some(ManaCost::Cost { generic, .. }) => generic,
+                _ => 0,
+            };
+            Ok((i, generic))
+        })
+        .map_or((0, text), |(generic, rest)| (generic, rest))
+    }
+
     let lower = text.to_lowercase();
 
     match kind {
-        GraveyardGrantedKeywordKind::Flashback => {
+        GrantedCastKeywordKind::Flashback => {
             let (_, rest) = nom_on_lower(text, &lower, |i| {
                 value((), tag("the flashback cost is equal to ")).parse(i)
             })?;
@@ -672,7 +702,7 @@ pub(crate) fn parse_graveyard_keyword_continuation(
                 ManaCost::SelfManaCost,
             )))
         }
-        GraveyardGrantedKeywordKind::Escape => {
+        GrantedCastKeywordKind::Escape => {
             let (_, rest) = nom_on_lower(text, &lower, |i| {
                 value((), tag("the escape cost is equal to ")).parse(i)
             })?;
@@ -710,7 +740,7 @@ pub(crate) fn parse_graveyard_keyword_continuation(
                 },
             )))
         }
-        GraveyardGrantedKeywordKind::Mayhem => {
+        GrantedCastKeywordKind::Mayhem => {
             // CR 702.187b: "The mayhem cost is equal to [its/that card's/the
             // card's] mana cost." (Green Goblin's Goblin Formula). Mirrors the
             // Flashback continuation; the cost resolves to the card's own mana
@@ -724,7 +754,7 @@ pub(crate) fn parse_graveyard_keyword_continuation(
             }
             Some(Keyword::Mayhem(ManaCost::SelfManaCost))
         }
-        GraveyardGrantedKeywordKind::Scavenge => {
+        GrantedCastKeywordKind::Scavenge => {
             // CR 702.97a: "The scavenge cost is equal to its mana cost." (Varolz,
             // the Scar-Striped; Young Deathclaws; The Cave of Skulls). Mirrors the
             // Flashback continuation; cost resolves to the card's own mana cost.
@@ -744,7 +774,7 @@ pub(crate) fn parse_graveyard_keyword_continuation(
             }
             Some(Keyword::Scavenge(ManaCost::SelfManaCost))
         }
-        GraveyardGrantedKeywordKind::Encore => {
+        GrantedCastKeywordKind::Encore => {
             // CR 702.141a: "Its encore cost is equal to its mana cost." (Wire
             // Surgeons). Same shape as scavenge.
             let (_, rest) = nom_on_lower(text, &lower, |i| {
@@ -762,6 +792,58 @@ pub(crate) fn parse_graveyard_keyword_continuation(
                 return None;
             }
             Some(Keyword::Encore(ManaCost::SelfManaCost))
+        }
+        GrantedCastKeywordKind::Foretell => {
+            // CR 702.143a + CR 601.2f: "Its foretell cost is equal to its mana
+            // cost reduced by {N}." (Dream Devourer, reduced by {2}). The bare
+            // "reduced by {0}"-absent form yields `SelfManaCost`; a nonzero
+            // reduction yields `SelfManaCostReduced`, both concretized at the
+            // runtime stamp point (`resolve_keyword_mana_cost`).
+            let (_, rest) = nom_on_lower(text, &lower, |i| {
+                value(
+                    (),
+                    alt((
+                        tag("its foretell cost is equal to "),
+                        tag("the foretell cost is equal to "),
+                    )),
+                )
+                .parse(i)
+            })?;
+            let rest = parse_self_mana_cost_suffix(rest)?;
+            let (reduction, rest) = parse_reduced_by_generic_suffix(rest);
+            if !continuation_fully_consumed(rest) {
+                return None;
+            }
+            Some(Keyword::Foretell(if reduction == 0 {
+                ManaCost::SelfManaCost
+            } else {
+                ManaCost::SelfManaCostReduced { reduction }
+            }))
+        }
+        GrantedCastKeywordKind::Miracle => {
+            // CR 702.94a + CR 601.2f: "Its miracle cost is equal to its mana cost
+            // reduced by {N}." (Aminatou, Veil Piercer, reduced by {4}). Same
+            // shape as the foretell continuation.
+            let (_, rest) = nom_on_lower(text, &lower, |i| {
+                value(
+                    (),
+                    alt((
+                        tag("its miracle cost is equal to "),
+                        tag("the miracle cost is equal to "),
+                    )),
+                )
+                .parse(i)
+            })?;
+            let rest = parse_self_mana_cost_suffix(rest)?;
+            let (reduction, rest) = parse_reduced_by_generic_suffix(rest);
+            if !continuation_fully_consumed(rest) {
+                return None;
+            }
+            Some(Keyword::Miracle(if reduction == 0 {
+                ManaCost::SelfManaCost
+            } else {
+                ManaCost::SelfManaCostReduced { reduction }
+            }))
         }
     }
 }
@@ -3457,6 +3539,45 @@ pub(crate) fn parse_oracle_ir(
             result.replacements.extend(replacements);
             i += 1;
             continue;
+        }
+
+        // CR 207.2c + CR 401.5 + CR 601.1a + CR 603.12: an (optionally
+        // ability-word-prefixed) top-of-library play/cast permission carrying a
+        // reflexive "When you do, <effect>" rider (The Fourth Doctor). Emits
+        // the permission static so play-from-library works, and marks the rider
+        // as an honest unsupported gap (TriggerMode::Unknown) — the reflexive
+        // trigger cannot be correctly scoped until the casting/land-play
+        // pipeline records which permission authorized each play (CR 603.12
+        // provenance limitation: a global PlayCard trigger cannot distinguish
+        // WHICH permission authorized a given play). Must precede Priority 7
+        // (the static-only path would silently drop the rider, hiding the gap).
+        {
+            let permission_line = strip_ability_word(&line).unwrap_or_else(|| line.clone());
+            let permission_lower = permission_line.to_lowercase();
+            if let Some((perm_text, _)) =
+                split_once_on_lower(&permission_line, &permission_lower, ". when you do, ")
+            {
+                let perm_lower = perm_text.to_lowercase();
+                if let Some(static_def) =
+                    try_parse_top_of_library_cast_permission(perm_text, &perm_lower)
+                {
+                    // CR 603.12 (deferred): emit TriggerMode::Unknown so the
+                    // rider gap is visible in coverage instead of approximating
+                    // incorrect provenance with a rules-incorrect PlayCard
+                    // trigger. No context mutation: we do not parse the rider
+                    // body here (avoids ctx.subject/actor leakage into
+                    // subsequent lines).
+                    let rider_gap =
+                        TriggerDefinition::new(TriggerMode::Unknown("when you do".to_string()))
+                            .description(line.to_string());
+                    result
+                        .statics
+                        .push(static_def.description(line.to_string()));
+                    result.triggers.push(rider_gap);
+                    i += 1;
+                    continue;
+                }
+            }
         }
 
         // CR 702.34a: Flashback em-dash / compound self-spell cost-reduction lines.

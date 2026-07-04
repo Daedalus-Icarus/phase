@@ -3406,6 +3406,7 @@ fn parse_unless_player_have_deal_damage_cost(after_unless: &str) -> Option<Abili
             amount,
             target: TargetFilter::Player,
             damage_source: None,
+            excess: None,
         }),
     })
 }
@@ -4557,6 +4558,7 @@ fn try_parse_have_causative(
                             amount,
                             target,
                             damage_source: None,
+                            excess: None,
                         }));
                     }
                 }
@@ -4565,6 +4567,7 @@ fn try_parse_have_causative(
                         amount,
                         target: TargetFilter::Player,
                         damage_source: None,
+                        excess: None,
                     }));
                 }
                 // CR 608.2d: "have this artifact deal 1 damage to it" (Requiem
@@ -4575,6 +4578,7 @@ fn try_parse_have_causative(
                         amount,
                         target: TargetFilter::ParentTarget,
                         damage_source: None,
+                        excess: None,
                     }));
                 }
             }
@@ -9951,7 +9955,7 @@ pub(crate) fn try_parse_grant_graveyard_keyword_to_target(
     )?;
     if !matches!(
         keyword_kind,
-        crate::parser::oracle_static::GraveyardGrantedKeywordKind::Escape
+        crate::parser::oracle_static::GrantedCastKeywordKind::Escape
     ) {
         return None;
     }
@@ -10414,10 +10418,15 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
                 amount,
                 target,
                 damage_source,
+                excess,
             } => Effect::DealDamage {
                 amount: replace_fixed_quantity(amount, quantity.clone()),
                 target,
                 damage_source,
+                // CR 120.4a: preserve the excess-redirect rider when the fixed
+                // amount is replaced by a for-each quantity (e.g. Gandalf's
+                // Sanction's X). Dropping it here would silently lose the redirect.
+                excess,
             },
             Effect::DamageEachPlayer {
                 amount,
@@ -13238,6 +13247,7 @@ fn parse_bare_damage_continuation<'a>(
                 amount,
                 target: TargetFilter::ParentTarget,
                 damage_source: None,
+                excess: None,
             },
             "",
         ));
@@ -13250,6 +13260,7 @@ fn parse_bare_damage_continuation<'a>(
             amount,
             target,
             damage_source: None,
+            excess: None,
         },
         rem,
     ))
@@ -17165,18 +17176,16 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
     if cast_filter_has_typed_leaf(&filter) {
         apply_cast_target_suffixes(&mut filter, rest);
         let alt_ability_cost = parse_alt_ability_cost_rider(lower);
-        let hand_origin = matches!(
-            &filter,
-            TargetFilter::Typed(tf)
-                if tf.properties.iter().any(|prop| {
-                    matches!(prop, FilterProp::InZone { zone: Zone::Hand })
-                })
+        // CR 608.2g vs CR 611.2: shared filter-form driver authority. `mode` and
+        // `alt_is_some` are no-ops for every current Branch-2 card (all hand-origin
+        // Branch-2 casts are `mode==Cast` with the rider inline only on Cruelclaw-
+        // shaped non-hand clauses); the §9 corpus driver-diff guards this.
+        let driver = during_resolution_for_filter_cast_clause(
+            mode,
+            without_paying,
+            alt_ability_cost.is_some(),
+            cast_target_is_hand_origin(&filter),
         );
-        let driver = if without_paying && alt_ability_cost.is_none() && hand_origin {
-            crate::types::ability::CastFromZoneDriver::DuringResolution
-        } else {
-            crate::types::ability::CastFromZoneDriver::LingeringPermission
-        };
         return Some(Effect::CastFromZone {
             target: filter,
             without_paying_mana_cost: without_paying,
@@ -17202,6 +17211,57 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
         driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
         mana_spend_permission: None,
     })
+}
+
+/// CR 601.2a: A "cast a <filter> from <zone>" clause is hand-origin when its
+/// top-level `Typed` filter carries an `InZone { Hand }` property. Mirrors the
+/// Branch-2 producer's own check so the alt-cost fold and the producer cannot
+/// drift.
+fn cast_target_is_hand_origin(target: &TargetFilter) -> bool {
+    matches!(target, TargetFilter::Typed(tf)
+        if tf.properties.iter().any(|prop| matches!(prop, FilterProp::InZone { zone: Zone::Hand })))
+}
+
+/// CR 608.2g vs CR 611.2: Decide the casting *mechanism* (DRIVER ONLY) of a
+/// *filter-form* cast-from-zone clause ("cast a <filter> [from <zone>] …") from
+/// its structural signals. This is the Branch-2 + alt-cost-fold driver
+/// authority (`try_parse_cast_effect` Branch 2 and
+/// `attach_alt_cost_to_prior_cast_from_zone`); the exile-*anaphor* immediate-cast
+/// form (Bring to Light) is the separate Branch-1 authority and is intentionally
+/// NOT routed through here — its identical field tuple maps to the opposite
+/// driver (anaphor of a just-exiled single card vs. a standing filter pool).
+///
+/// DURATION IS DELIBERATELY NOT A PARAMETER. The driver is decided while any
+/// leading duration is stripped (`parse_effect_clause`), and the duration is
+/// stamped by a *separate* orthogonal pass (`with_clause_duration`) that never
+/// touches `driver`. The engine ships hand-origin `DuringResolution` casts that
+/// ALSO carry `duration=UntilEndOfTurn` (twinning glass, chandra flame's
+/// catalyst ultimate); a durational hand-origin free-cast is NOT lingering. The
+/// real discriminator is the *alternative casting method* (`without_paying` OR
+/// an alternative cost), proven by Sen Triplets (hand-origin, durational,
+/// FULL-cost → lingering) sitting opposite twinning glass (hand-origin,
+/// durational, FREE → during-resolution).
+///
+/// Casts during resolution iff it is a `Cast` (CR 601.2, not a CR 305.1 land
+/// play) from a `hand` origin via an alternative casting method — free
+/// (`without_paying`: the Expertise cycle, Brain in a Jar) OR an alternative
+/// cost (`alt_is_some`: The Face of Boe's suspend cost). A *full-cost*
+/// continuous "as though" permission (Colossal Dreadmaw / Form of the
+/// Mulldrifter / Sen Triplets — hand-origin, neither free nor alt-cost) is a
+/// standing grant (CR 611.2); non-hand pools (Memory Plunder, Tasha) likewise
+/// stay lingering permissions exercised at a later priority window.
+fn during_resolution_for_filter_cast_clause(
+    mode: CardPlayMode,
+    without_paying: bool,
+    alt_is_some: bool,
+    hand_origin: bool,
+) -> crate::types::ability::CastFromZoneDriver {
+    use crate::types::ability::CastFromZoneDriver;
+    if mode == CardPlayMode::Cast && hand_origin && (without_paying || alt_is_some) {
+        CastFromZoneDriver::DuringResolution
+    } else {
+        CastFromZoneDriver::LingeringPermission
+    }
 }
 
 /// CR 601.2 + CR 609.4b + CR 608.2g: "[you may ]cast target [type] card from
@@ -17359,8 +17419,14 @@ fn parse_with_mana_value_constraint(lower: &str) -> Option<CastPermissionConstra
 /// Oracle text that carries an alternative-casting-cost rider. Shared by
 /// standalone rider clauses and inline `CastFromZone` anaphor arms.
 fn parse_alt_ability_cost_rider(lower: &str) -> Option<crate::types::ability::AbilityCost> {
+    // CR 118.9: alternative-cost riders are templated "rather than [paying] its
+    // mana cost". The verbless "rather than its mana cost" (The Face of Boe:
+    // "pay its suspend cost rather than its mana cost") is a distinct, non-
+    // overlapping surface form — "rather than paying its mana cost" never
+    // contains it contiguously (the intervening "paying " breaks the match).
     if !nom_primitives::scan_contains(lower, "rather than paying its mana cost")
         && !nom_primitives::scan_contains(lower, "rather than pay its mana cost")
+        && !nom_primitives::scan_contains(lower, "rather than its mana cost")
     {
         return None;
     }
@@ -17384,6 +17450,15 @@ fn parse_alt_ability_cost_rider(lower: &str) -> Option<crate::types::ability::Ab
             amount: crate::types::ability::QuantityExpr::Ref {
                 qty: crate::types::ability::QuantityRef::SelfManaValue,
             },
+        });
+    }
+    // CR 702.62a + CR 118.9: "pay its suspend cost rather than its mana cost"
+    // (The Face of Boe). Ordered AFTER discard/pay-life so Cruelclaw and Nashi
+    // keep their existing costs; the suspend body fires only when neither
+    // matched.
+    if nom_primitives::scan_contains(lower, "its suspend cost") {
+        return Some(crate::types::ability::AbilityCost::KeywordCostOfCastSpell {
+            keyword: crate::types::keywords::KeywordKind::Suspend,
         });
     }
     None
@@ -17490,9 +17565,29 @@ fn attach_alt_cost_to_prior_cast_from_zone(
         }
         if let Effect::CastFromZone {
             alt_ability_cost: alt @ None,
+            driver,
+            mode,
+            without_paying_mana_cost,
+            target,
             ..
         } = &mut *def.effect
         {
+            // CR 608.2g vs CR 611.2: re-derive the casting MECHANISM from the
+            // cast clause's structure now that an alternative cost attaches.
+            // Shares the Branch-2 (filter-form) authority. The driver is a
+            // property of the clause (mode + hand-origin + alternative casting
+            // method), NOT of the cost (CR 118.9) and NOT of the duration —
+            // duration is stamped by the orthogonal `with_clause_duration` pass
+            // and is left untouched here. `alt_is_some = true` because we are
+            // attaching one. The exile-origin folded rider (Xander's Pact,
+            // `ExiledBySource` → hand_origin false) correctly stays
+            // `LingeringPermission` via the hand gate.
+            *driver = during_resolution_for_filter_cast_clause(
+                *mode,
+                *without_paying_mana_cost,
+                true,
+                cast_target_is_hand_origin(target),
+            );
             *alt = Some(cost.clone());
             return true;
         }
@@ -20232,6 +20327,7 @@ pub fn parse_effect_chain(text: &str, kind: AbilityKind) -> AbilityDefinition {
     let mut def = lower_effect_chain_ir(&ir);
     sequence::patch_reveal_until_for_library_category_exile(&mut def);
     fold_speed_floor_sentences(&mut def);
+    fold_additional_combat_attacker_restriction(&mut def);
     def
 }
 
@@ -20268,6 +20364,7 @@ pub(crate) fn parse_effect_chain_with_context(
     let mut def = lower_effect_chain_ir(&ir);
     sequence::patch_reveal_until_for_library_category_exile(&mut def);
     fold_speed_floor_sentences(&mut def);
+    fold_additional_combat_attacker_restriction(&mut def);
     def
 }
 
@@ -20463,6 +20560,91 @@ fn try_parse_return_target_and_same_name_from_your_graveyard(
         },
     )));
     Some(def)
+}
+
+/// CR 508.1c + CR 611.2c: Parse "only X can attack during that combat phase"
+/// (Last Night Together, Bumi) → the `TargetFilter` describing the permitted
+/// attackers. The subject (`X`) is delegated to the shared typed-target
+/// combinator `parse_target_with_ctx`, so "the chosen creatures"
+/// (`ParentTarget`), "those creatures" (`TrackedSet`), and "<type> creature(s)"
+/// (`Typed`, e.g. Bumi's "land creatures") all resolve without re-implementing
+/// subject parsing. Only enforceable subjects are accepted; any other filter
+/// returns `None`, leaving the clause as `Unimplemented` (a documented
+/// strict-failure — never a silent misparse).
+fn parse_only_can_attack_restriction(text: &str) -> Option<TargetFilter> {
+    // allow-noncombinator: structural trailing-period cleanup on a whole
+    // description string before combinator parsing (PATTERNS.md §9).
+    let text = text.trim().trim_end_matches('.').trim();
+    let lower = text.to_lowercase();
+    // Strip the leading "only " quantifier (description is capitalized "Only").
+    let ((), after_only) = nom_on_lower(text, &lower, |i| value((), tag("only ")).parse(i))?;
+    // Delegate the subject phrase to the shared typed-target combinator.
+    let mut ctx = ParseContext::default();
+    let (filter, after_subject) = parse_target_with_ctx(after_only, &mut ctx);
+    // Require the exact trailing clause on the remainder.
+    let after_subject = after_subject.trim_start();
+    let after_lower = after_subject.to_lowercase();
+    let ((), rest) = nom_on_lower(after_subject, &after_lower, |i| {
+        value((), tag("can attack during that combat phase")).parse(i)
+    })?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    // CR 508.1c: accept only subjects the combat enforcement path can evaluate.
+    match filter {
+        TargetFilter::ParentTarget
+        | TargetFilter::Typed(_)
+        | TargetFilter::SelfRef
+        | TargetFilter::TrackedSet { .. } => Some(filter),
+        _ => None,
+    }
+}
+
+/// CR 508.1c + CR 611.2c: Fold a trailing "Only X can attack during that combat
+/// phase" sub-ability sentence into the preceding `AdditionalPhase` effect's
+/// `attacker_restriction` field, then delete the now-redundant `Unimplemented`
+/// node. Mirrors [`fold_speed_floor_sentences`]: the restriction sentence parses
+/// as its own `Effect::unimplemented("only", …)` sub-ability; leaving it
+/// would surface a spurious unimplemented gap (Last Night Together).
+pub(crate) fn fold_additional_combat_attacker_restriction(def: &mut AbilityDefinition) {
+    let mut cursor: &mut AbilityDefinition = def;
+    loop {
+        let folded = match (&*cursor.effect, &cursor.sub_ability) {
+            (
+                Effect::AdditionalPhase {
+                    phase: Phase::BeginCombat,
+                    attacker_restriction: None,
+                    ..
+                },
+                Some(child),
+            ) => match &*child.effect {
+                Effect::Unimplemented { description, .. } => description
+                    .as_deref()
+                    .and_then(parse_only_can_attack_restriction),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(filter) = folded {
+            // Re-link past the restriction sentence, then fold the filter in.
+            let grandchild = cursor
+                .sub_ability
+                .take()
+                .and_then(|child| child.sub_ability);
+            cursor.sub_ability = grandchild;
+            if let Effect::AdditionalPhase {
+                attacker_restriction,
+                ..
+            } = &mut *cursor.effect
+            {
+                *attacker_restriction = Some(filter);
+            }
+        }
+        match cursor.sub_ability.as_deref_mut() {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
 }
 
 /// CR 702.179c-d: Fold a trailing "This effect can't reduce their speed below
@@ -20869,6 +21051,14 @@ pub(crate) fn parse_effect_chain_ir(
                     description: None,
                 }),
                 boundary: chunk.boundary_after,
+                // CR 118.9: `condition: None` is intentional. The chunk's
+                // "If you do," gate (`OptionalEffectPerformed`) is deliberately
+                // discarded: the alternative cost is inherently conditional on the
+                // cast occurring, and `attach_alt_cost_to_prior_cast_from_zone`
+                // ties it to the `CastFromZone` permission, which only charges the
+                // cost when a card is actually picked and cast. Propagating the
+                // condition would double-gate (the folded `alt_ability_cost` has no
+                // condition field to carry it anyway).
                 condition: None,
                 is_optional: false,
                 opponent_may_scope: None,
@@ -24359,6 +24549,7 @@ fn parse_unless_have_deal_damage_cost(after_unless: &str) -> Option<AbilityCost>
             amount,
             target: TargetFilter::Player,
             damage_source: None,
+            excess: None,
         }),
     })
 }
@@ -25447,4 +25638,80 @@ fn for_each_target_player_controls_search_that_players_library_keeps_caster_sear
         panic!("expected typed target-player library owner, got {target_player:?}");
     };
     assert_eq!(target_player.controller, None);
+}
+
+/// CR 508.1c + CR 611.2c: building-block test for the "only X can attack during
+/// that combat phase" subject parser. Covers every enforceable subject class and
+/// the strict-fail boundary (unrecognized clause → `None`, stays Unimplemented).
+#[test]
+fn parse_only_can_attack_restriction_covers_subject_class() {
+    // "the chosen creatures" → ParentTarget (Last Night Together).
+    assert_eq!(
+        parse_only_can_attack_restriction(
+            "Only the chosen creatures can attack during that combat phase"
+        ),
+        Some(TargetFilter::ParentTarget)
+    );
+    // Trailing period tolerated.
+    assert_eq!(
+        parse_only_can_attack_restriction(
+            "Only the chosen creatures can attack during that combat phase."
+        ),
+        Some(TargetFilter::ParentTarget)
+    );
+    // "land creatures" → Typed (Bumi, Unleashed) — re-evaluated continuously.
+    match parse_only_can_attack_restriction(
+        "Only land creatures can attack during that combat phase",
+    ) {
+        Some(TargetFilter::Typed(_)) => {}
+        other => panic!("expected Typed(land creature) restriction, got {other:?}"),
+    }
+    // Strict-fail boundary: a different trailing clause is not an attack
+    // restriction — return None so the clause stays a documented Unimplemented.
+    assert_eq!(
+        parse_only_can_attack_restriction("Only the chosen creatures can block this turn"),
+        None
+    );
+}
+
+/// CR 508.1c: Last Night Together's sixth sentence must fold onto the scheduled
+/// `AdditionalPhase` rather than surfacing as an `Unimplemented` gap.
+#[test]
+fn last_night_together_folds_attacker_restriction_into_additional_phase() {
+    let def = parse_effect_chain(
+        "Choose two target creatures. Untap them. Put two +1/+1 counters on each of them. \
+         They gain vigilance, indestructible, and haste until end of turn. After this main \
+         phase, there is an additional combat phase. Only the chosen creatures can attack \
+         during that combat phase.",
+        AbilityKind::Spell,
+    );
+
+    let mut node = Some(&def);
+    let mut saw_additional_phase = false;
+    while let Some(d) = node {
+        match d.effect.as_ref() {
+            Effect::Unimplemented { name, .. } => {
+                panic!("unexpected Unimplemented node remained after fold: {name}");
+            }
+            Effect::AdditionalPhase {
+                phase,
+                attacker_restriction,
+                ..
+            } => {
+                assert_eq!(*phase, Phase::BeginCombat);
+                assert_eq!(
+                    attacker_restriction.as_ref(),
+                    Some(&TargetFilter::ParentTarget),
+                    "the chosen-creatures restriction must fold onto AdditionalPhase"
+                );
+                saw_additional_phase = true;
+            }
+            _ => {}
+        }
+        node = d.sub_ability.as_deref();
+    }
+    assert!(
+        saw_additional_phase,
+        "the AdditionalPhase clause must be present in the chain"
+    );
 }

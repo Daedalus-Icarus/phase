@@ -1837,6 +1837,14 @@ fn can_attack(state: &GameState, obj_id: ObjectId) -> bool {
         return false;
     }
 
+    // CR 508.1c + CR 611.2c: respect an active additional-combat attacker
+    // restriction (Last Night Together / Bumi). Hardens this hypothetical/test
+    // fallback path; at runtime the AI consumes the engine's pre-filtered
+    // valid_attacker_ids, and validate_attackers remains the ultimate gate.
+    if !engine::game::combat::passes_combat_attacker_restriction(state, obj_id) {
+        return false;
+    }
+
     // Summoning sickness check
     if obj.has_keyword(&Keyword::Haste) {
         return true;
@@ -3280,6 +3288,7 @@ mod tests {
                     },
                     target: TargetFilter::Controller,
                     damage_source: None,
+                    excess: None,
                 },
             ))
             .valid_card(TargetFilter::SelfRef)
@@ -3326,6 +3335,7 @@ mod tests {
                     },
                     target: TargetFilter::Controller,
                     damage_source: None,
+                    excess: None,
                 },
             ))
             .valid_card(TargetFilter::SelfRef)

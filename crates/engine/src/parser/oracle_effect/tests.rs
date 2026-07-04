@@ -1,6 +1,8 @@
 use super::*;
 use crate::parser::parse_oracle_text;
 use crate::types::ability::AttachmentKind;
+use crate::types::ability::CardPlayMode::{Cast, Play};
+use crate::types::ability::CastFromZoneDriver::{DuringResolution, LingeringPermission};
 use crate::types::card_type::CoreType;
 use crate::types::mana::ManaCostShard;
 
@@ -3290,6 +3292,7 @@ fn effect_damage_to_defending_player_counts_defending_player_objects() {
                 },
             target: TargetFilter::DefendingPlayer,
             damage_source: None,
+            excess: _,
         } => {
             assert_eq!(tf.controller, Some(ControllerRef::DefendingPlayer));
             assert!(tf
@@ -3500,6 +3503,7 @@ fn damage_to_itself_equal_to_power_low_level() {
                 },
                 target: TargetFilter::ParentTarget,
                 damage_source: Some(DamageSource::Target),
+                excess: _,
             }
         ),
         "expected DealDamage with TargetPower/ParentTarget, got: {e:?}"
@@ -3524,6 +3528,7 @@ fn damage_to_itself_equal_to_power_full_pipeline() {
                 },
                 target: TargetFilter::ParentTarget,
                 damage_source: Some(DamageSource::Target),
+                excess: _,
             }
         ),
         "expected DealDamage with TargetPower/ParentTarget, got: {:?}",
@@ -3545,6 +3550,7 @@ fn damage_to_any_target_and_itself_preserves_both_segments() {
                 amount: QuantityExpr::Fixed { value: 2 },
                 target: TargetFilter::Any,
                 damage_source: None,
+                excess: _,
             }
         ),
         "expected primary any-target damage, got {:?}",
@@ -3562,6 +3568,7 @@ fn damage_to_any_target_and_itself_preserves_both_segments() {
                 amount: QuantityExpr::Fixed { value: 3 },
                 target: TargetFilter::SelfRef,
                 damage_source: None,
+                excess: _,
             }
         ),
         "expected self-damage continuation, got {:?}",
@@ -3587,6 +3594,7 @@ fn self_subject_damage_equal_to_its_power_uses_source_power() {
                 },
                 target: TargetFilter::Typed(_),
                 damage_source: None,
+                excess: _,
             }
         ),
         "expected source-power DealDamage, got: {:?}",
@@ -3617,6 +3625,7 @@ fn damage_equal_to_object_count_resolves_to_object_count_not_variable() {
                 },
                 target: TargetFilter::Any,
                 damage_source: None,
+                excess: _,
             }
         ),
         "expected ObjectCount-amount DealDamage to Any, got: {:?}",
@@ -3653,6 +3662,7 @@ fn target_subject_damage_equal_to_its_power_uses_target_source_power() {
                 },
                 target: TargetFilter::Or { .. },
                 damage_source: Some(DamageSource::Target),
+                excess: _,
             }
         ),
         "expected target-source-power damage, got {:?}",
@@ -10963,7 +10973,10 @@ fn effect_gain_keyword_and_must_be_blocked_splits_into_chained_generic_effects()
             duration,
             ..
         } => {
-            assert_eq!(static_abilities[0].mode, StaticMode::MustBeBlocked);
+            assert_eq!(
+                static_abilities[0].mode,
+                StaticMode::MustBeBlocked { by: None }
+            );
             assert_eq!(*duration, Some(Duration::UntilEndOfTurn));
             assert_eq!(
                 static_abilities[0].affected,
@@ -11617,14 +11630,14 @@ fn grant_graveyard_keyword_front_door_declines_self_mana_cost_siblings() {
 #[test]
 fn parse_graveyard_granted_keyword_kind_recognizes_all_members() {
     use crate::parser::oracle_static::{
-        parse_graveyard_granted_keyword_kind, GraveyardGrantedKeywordKind,
+        parse_graveyard_granted_keyword_kind, GrantedCastKeywordKind,
     };
     for (word, expected) in [
-        ("flashback", GraveyardGrantedKeywordKind::Flashback),
-        ("escape", GraveyardGrantedKeywordKind::Escape),
-        ("mayhem", GraveyardGrantedKeywordKind::Mayhem),
-        ("scavenge", GraveyardGrantedKeywordKind::Scavenge),
-        ("encore", GraveyardGrantedKeywordKind::Encore),
+        ("flashback", GrantedCastKeywordKind::Flashback),
+        ("escape", GrantedCastKeywordKind::Escape),
+        ("mayhem", GrantedCastKeywordKind::Mayhem),
+        ("scavenge", GrantedCastKeywordKind::Scavenge),
+        ("encore", GrantedCastKeywordKind::Encore),
     ] {
         let (_, kind) = parse_graveyard_granted_keyword_kind(word)
             .unwrap_or_else(|_| panic!("combinator failed on {word:?}"));
@@ -12431,6 +12444,7 @@ fn deal_damage_each_of_one_or_two_targets_is_multi_targeted() {
         amount: QuantityExpr::Fixed { value: 1 },
         target: TargetFilter::Any,
         damage_source: None,
+        excess: _,
     } = clause.effect
     else {
         panic!(
@@ -12451,6 +12465,7 @@ fn deal_damage_each_of_up_to_two_target_creatures_is_multi_targeted() {
         amount: QuantityExpr::Fixed { value: 6 },
         target: TargetFilter::Or { filters },
         damage_source: None,
+        excess: _,
     } = clause.effect
     else {
         panic!(
@@ -12487,6 +12502,7 @@ fn deal_damage_divided_among_up_to_two_target_creatures_planeswalkers() {
         amount: QuantityExpr::Fixed { value: 5 },
         target: TargetFilter::Or { filters },
         damage_source: None,
+        excess: _,
     } = clause.effect
     else {
         panic!(
@@ -12523,6 +12539,7 @@ fn deal_damage_divided_x_among_up_to_two_targets() {
                 },
                 target: TargetFilter::Or { .. },
                 damage_source: None,
+                excess: _,
             }
         ),
         "Expected divided X DealDamage with multi_target, got {:?}",
@@ -16159,7 +16176,10 @@ fn must_be_blocked_imperative() {
     assert!(
         matches!(&e, Effect::GenericEffect { static_abilities, .. }
             if static_abilities.iter().any(|sd|
-                sd.mode == crate::types::statics::StaticMode::MustBeBlocked
+                matches!(
+                    sd.mode,
+                    crate::types::statics::StaticMode::MustBeBlocked { by: None }
+                )
             )
         ),
         "Expected GenericEffect with MustBeBlocked, got {:?}",
@@ -16174,7 +16194,10 @@ fn must_be_blocked_if_able_variant() {
     assert!(
         matches!(&e, Effect::GenericEffect { static_abilities, .. }
             if static_abilities.iter().any(|sd|
-                sd.mode == crate::types::statics::StaticMode::MustBeBlocked
+                matches!(
+                    sd.mode,
+                    crate::types::statics::StaticMode::MustBeBlocked { by: None }
+                )
             )
         ),
         "Expected GenericEffect with MustBeBlocked, got {:?}",
@@ -16203,7 +16226,10 @@ fn pump_compound_with_must_be_blocked() {
     assert!(
         matches!(&*sub.effect, Effect::GenericEffect { static_abilities, .. }
             if static_abilities.iter().any(|sd|
-                sd.mode == crate::types::statics::StaticMode::MustBeBlocked
+                matches!(
+                    sd.mode,
+                    crate::types::statics::StaticMode::MustBeBlocked { by: None }
+                )
             )
         ),
         "Expected sub_ability GenericEffect with MustBeBlocked, got {:?}",
@@ -25966,7 +25992,10 @@ fn for_each_pump_with_keyword_preserves_must_be_blocked_followup() {
     assert!(
         matches!(&*sub.effect, Effect::GenericEffect { static_abilities, .. }
             if static_abilities.iter().any(|sd|
-                sd.mode == crate::types::statics::StaticMode::MustBeBlocked
+                matches!(
+                    sd.mode,
+                    crate::types::statics::StaticMode::MustBeBlocked { by: None }
+                )
             )
         ),
         "expected sub_ability GenericEffect with MustBeBlocked, got {:?}",
@@ -27799,6 +27828,7 @@ fn one_sided_fight_dealdamage_keeps_fresh_opponent_recipient() {
             target,
             amount,
             damage_source,
+            excess: _,
         } => {
             // Recipient must stay a fresh opponent target, NOT ParentTarget.
             assert_ne!(
@@ -27856,6 +27886,7 @@ fn one_sided_fight_power_source_variant() {
             target,
             amount,
             damage_source,
+            excess: _,
         } => {
             assert_ne!(target, &TargetFilter::ParentTarget);
             assert!(
@@ -38024,6 +38055,110 @@ fn reef_worm_nested_token_is_not_modal_choice() {
         );
     };
     assert_eq!(name, "Fish", "outer token is the 3/3 Fish");
+}
+
+/// CR 702.62a + CR 118.9: The Face of Boe's verbless "pay its suspend cost
+/// rather than its mana cost" rider must parse to the parameterized
+/// `KeywordCostOfCastSpell { Suspend }` alternative cost (broadened head
+/// guard + suspend body recognizer).
+#[test]
+fn suspend_cost_rider_recognized() {
+    assert_eq!(
+        super::parse_alt_ability_cost_rider("pay its suspend cost rather than its mana cost"),
+        Some(crate::types::ability::AbilityCost::KeywordCostOfCastSpell {
+            keyword: crate::types::keywords::KeywordKind::Suspend,
+        }),
+    );
+}
+
+/// Regression guard for the broadened head guard + body ordering: the discard
+/// (Cruelclaw) and pay-life (Nashi) riders must keep returning their existing
+/// costs unchanged — the suspend body only fires when neither matched.
+#[test]
+fn discard_and_pay_life_riders_unchanged_by_suspend_addition() {
+    assert!(matches!(
+        super::parse_alt_ability_cost_rider(
+            "cast that card by discarding a card rather than paying its mana cost"
+        ),
+        Some(crate::types::ability::AbilityCost::Discard { .. })
+    ));
+    assert!(matches!(
+        super::parse_alt_ability_cost_rider(
+            "pay life equal to its mana value rather than paying its mana cost"
+        ),
+        Some(crate::types::ability::AbilityCost::PayLife { .. })
+    ));
+}
+
+/// CR 608.2g vs CR 611.2 + CR 118.9: The Face of Boe's full cast clause folds
+/// the suspend cost onto the hand-origin `CastFromZone` AND re-derives the
+/// driver to `DuringResolution` (the alt-cost arm of the shared filter-form
+/// authority), with no `Unimplemented` leaking anywhere.
+#[test]
+fn face_of_boe_clause_folds_suspend_cost_and_during_resolution() {
+    let def = super::parse_effect_chain(
+        "you may cast a spell with suspend from your hand. if you do, pay its suspend cost rather than its mana cost.",
+        AbilityKind::Activated,
+    );
+    fn find_cast(d: &AbilityDefinition) -> Option<&Effect> {
+        if matches!(*d.effect, Effect::CastFromZone { .. }) {
+            return Some(&d.effect);
+        }
+        d.sub_ability.as_ref().and_then(|s| find_cast(s))
+    }
+    let cast = find_cast(&def).expect("CastFromZone should be in chain");
+    let Effect::CastFromZone {
+        alt_ability_cost: Some(alt),
+        driver,
+        ..
+    } = cast
+    else {
+        panic!("expected CastFromZone with alt_ability_cost, got {cast:?}");
+    };
+    assert_eq!(
+        *alt,
+        crate::types::ability::AbilityCost::KeywordCostOfCastSpell {
+            keyword: crate::types::keywords::KeywordKind::Suspend,
+        },
+        "expected folded KeywordCostOfCastSpell {{ Suspend }}",
+    );
+    assert_eq!(
+        *driver,
+        crate::types::ability::CastFromZoneDriver::DuringResolution,
+        "hand-origin alt-cost cast must re-derive to DuringResolution",
+    );
+    fn has_unimpl(d: &AbilityDefinition) -> bool {
+        matches!(&*d.effect, Effect::Unimplemented { .. })
+            || d.sub_ability.as_ref().is_some_and(|s| has_unimpl(s))
+    }
+    assert!(
+        !has_unimpl(&def),
+        "no Unimplemented may survive the suspend-cost fold"
+    );
+}
+
+/// CR 608.2g vs CR 611.2: the shared filter-form DRIVER authority is
+/// duration-blind — the discriminator is mode + hand-origin + an alternative
+/// casting method (`without_paying` OR an alternative cost). Duration is
+/// intentionally not a parameter: twinning glass (durational, free →
+/// DuringResolution) and Sen Triplets (durational, full-cost → Lingering)
+/// prove the wp/alt axis decides, not duration.
+#[test]
+fn filter_cast_driver_authority_is_duration_blind() {
+    let d = super::during_resolution_for_filter_cast_clause;
+    // The Face of Boe via fold: hand-origin alt cost.
+    assert_eq!(d(Cast, false, true, true), DuringResolution);
+    // Colossal Dreadmaw / Form of the Mulldrifter / Sen Triplets: full-cost
+    // hand cast (durational or not) -> standing grant.
+    assert_eq!(d(Cast, false, false, true), LingeringPermission);
+    // Memory Plunder / Tasha: non-hand free pool.
+    assert_eq!(d(Cast, true, false, false), LingeringPermission);
+    // Expertise cycle / Brain in a Jar / twinning glass / chandra: hand free.
+    assert_eq!(d(Cast, true, false, true), DuringResolution);
+    // Xander's Pact: exile-origin alt cost — hand gate, not duration.
+    assert_eq!(d(Cast, false, true, false), LingeringPermission);
+    // CR 305.1 land plays have no during-resolution mechanism.
+    assert_eq!(d(Play, true, false, true), LingeringPermission);
 }
 
 #[test]
