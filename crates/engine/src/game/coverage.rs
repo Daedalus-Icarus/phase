@@ -41,7 +41,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Data-carrying static mode variants that are supported but can't be registered
 /// by exact key in the static registry (because the key includes runtime data).
-fn is_data_carrying_static(mode: &StaticMode) -> bool {
+pub(crate) fn is_data_carrying_static(mode: &StaticMode) -> bool {
     matches!(
         mode,
         // CR 514.2: nullary marker static — runtime enforcement is the cleanup
@@ -128,6 +128,13 @@ fn is_data_carrying_static(mode: &StaticMode) -> bool {
             // direct-match in combat.rs declare-blockers validation (mirrors
             // CantBeBlockedBy).
             | StaticMode::MustBeBlocked { .. }
+            // CR 509.1c: MustBeBlockedByAll carries an optional blocker
+            // `TargetFilter` (None = all creatures (Lure); Some = only matching
+            // creatures compelled, Talruum Piper flying / Marble Priest Walls).
+            // The variant is now parameterized with a non-Hash TargetFilter, so
+            // it is no longer registry-keyed; runtime enforcement is direct-match
+            // in combat.rs declare-blockers validation (mirrors MustBeBlocked).
+            | StaticMode::MustBeBlockedByAll { .. }
             // CR 509.1b: CantBeBlockedExceptBy carries `kind`.
             | StaticMode::CantBeBlockedExceptBy { .. }
             // CR 702.39a + CR 509.1c: MustBlockAttacker carries the `ObjectId` of
@@ -8152,7 +8159,7 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                 static_abilities.iter().any(|s| match &s.mode {
                     // CR 509.1c: "All creatures able to block ~ do so" lowers to the
                     // lure-strength MustBeBlockedByAll (not the one-blocker MustBeBlocked).
-                    StaticMode::MustBeBlockedByAll => {
+                    StaticMode::MustBeBlockedByAll { .. } => {
                         effective_lower.contains("able to block")
                             && effective_lower.contains("do so")
                     }
@@ -10569,6 +10576,7 @@ mod tests {
                     characteristic_defining: false,
                     description: None,
                     attack_defended: None,
+                    source_controller: None,
                 }],
                 duration: Some(Duration::UntilEndOfTurn),
                 target: None,
@@ -10613,6 +10621,7 @@ mod tests {
                     characteristic_defining: false,
                     description: None,
                     attack_defended: None,
+                    source_controller: None,
                 }],
                 duration: Some(Duration::UntilEndOfTurn),
                 target: None,
@@ -11598,6 +11607,7 @@ mod tests {
                 "As an additional cost to cast blue permanent spells, you may pay 2 life. Those spells cost less to cast.".to_string(),
             ),
             attack_defended: None,
+            source_controller: None,
         });
 
         assert!(audit_card_lines(oracle, &face).is_empty());
@@ -11629,6 +11639,7 @@ mod tests {
                 "As an additional cost to cast blue permanent spells, you may pay 2 life. Those spells cost less to cast.".to_string(),
             ),
             attack_defended: None,
+            source_controller: None,
         });
 
         assert!(audit_card_lines(oracle, &face).is_empty());
@@ -11658,6 +11669,7 @@ mod tests {
             characteristic_defining: false,
             description: None,
             attack_defended: None,
+            source_controller: None,
         });
 
         let findings = audit_card_lines(oracle, &face);
@@ -11805,6 +11817,7 @@ mod tests {
             characteristic_defining: false,
             description: Some("Skip your draw step.".to_string()),
             attack_defended: None,
+            source_controller: None,
         });
 
         assert!(
@@ -11834,6 +11847,7 @@ mod tests {
             characteristic_defining: false,
             description: Some("Players skip their upkeep steps.".to_string()),
             attack_defended: None,
+            source_controller: None,
         });
 
         assert!(
@@ -11873,6 +11887,7 @@ mod tests {
             characteristic_defining: false,
             description: Some("Players can't draw cards.".to_string()),
             attack_defended: None,
+            source_controller: None,
         });
 
         let gaps = card_face_gaps(&face);
@@ -11903,6 +11918,7 @@ mod tests {
             characteristic_defining: false,
             description: Some("You can't draw cards.".to_string()),
             attack_defended: None,
+            source_controller: None,
         });
 
         let gaps = card_face_gaps(&face);
@@ -11935,6 +11951,7 @@ mod tests {
             characteristic_defining: false,
             description: Some(oracle.to_string()),
             attack_defended: None,
+            source_controller: None,
         });
 
         let gaps = card_face_gaps(&face);
@@ -11973,6 +11990,7 @@ mod tests {
                 characteristic_defining: false,
                 description: Some(description.to_string()),
                 attack_defended: None,
+                source_controller: None,
             });
         }
 
@@ -12113,6 +12131,7 @@ mod tests {
             characteristic_defining: false,
             description: Some(oracle.to_string()),
             attack_defended: None,
+            source_controller: None,
         });
 
         assert!(
