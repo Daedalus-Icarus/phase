@@ -3372,6 +3372,14 @@ pub enum WaitingFor {
         crew_power: u32,
         /// Untapped creatures the player controls (excluding the Vehicle itself).
         eligible_creatures: Vec<ObjectId>,
+        /// CR 702.122a: each eligible creature's crew-power contribution
+        /// (`object_crew_power_contribution`), aligned index-for-index with
+        /// `eligible_creatures`. The engine owns this computation — "as though its
+        /// power were N greater" (Pilot tokens) and "using its toughness" (Giant
+        /// Ox) mean the contribution differs from the creature's printed power, so
+        /// the UI MUST sum these values, not raw power, when gating the selection.
+        #[serde(default)]
+        contributions: Vec<i32>,
     },
     /// CR 702.184a: Player must pick another untapped creature they control
     /// to tap as the station ability's cost. The chosen creature's power
@@ -3391,6 +3399,10 @@ pub enum WaitingFor {
         saddle_power: u32,
         /// Untapped creatures the player controls (excluding the Mount itself).
         eligible_creatures: Vec<ObjectId>,
+        /// CR 702.171a: each eligible creature's saddle-power contribution,
+        /// aligned index-for-index with `eligible_creatures`.
+        #[serde(default)]
+        contributions: Vec<i32>,
     },
     ScryChoice {
         player: PlayerId,
@@ -10487,6 +10499,30 @@ mod tests {
         assert_eq!(wf, deserialized);
         // Verify tag format
         assert!(json.contains("\"TriggerTargetSelection\""));
+    }
+
+    #[test]
+    fn crew_vehicle_legacy_missing_contributions_deserializes() {
+        let json = r#"{
+            "type":"CrewVehicle",
+            "data":{
+                "player":0,
+                "vehicle_id":30,
+                "crew_power":3,
+                "eligible_creatures":[10]
+            }
+        }"#;
+        let wf: WaitingFor = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            wf,
+            WaitingFor::CrewVehicle {
+                player: PlayerId(0),
+                vehicle_id: ObjectId(30),
+                crew_power: 3,
+                eligible_creatures: vec![ObjectId(10)],
+                contributions: Vec::new(),
+            }
+        );
     }
 
     #[test]
