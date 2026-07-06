@@ -358,6 +358,7 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         | Effect::SolveCase
         | Effect::Specialize
         | Effect::StartYourEngines { .. }
+        | Effect::SwapChosenLabels { .. }
         | Effect::SwitchPT { .. }
         | Effect::TakeTheInitiative
         | Effect::TargetOnly { .. }
@@ -856,6 +857,7 @@ pub(crate) fn modification_polarity(m: &ContinuousModification) -> EffectPolarit
         ContinuousModification::AddDynamicPower { .. }
         | ContinuousModification::AddDynamicToughness { .. } => EffectPolarity::Beneficial,
         ContinuousModification::AddKeyword { .. }
+        | ContinuousModification::AddKeywordWithDerivedCost { .. }
         | ContinuousModification::GrantAbility { .. }
         | ContinuousModification::AddAllCreatureTypes
         | ContinuousModification::AddColor { .. }
